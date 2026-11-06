@@ -1,0 +1,68 @@
+export interface PreflightOption {
+  network: string;
+  asset: string;
+  amount: string;
+  price: string;
+  usd?: number;
+  pay_to: string;
+  decision: "allow" | "hold" | "block";
+  reasons?: string[];
+  payment_hash: string;
+}
+
+export interface Decision {
+  url: string;
+  decision: "allow" | "hold" | "block";
+  options: PreflightOption[];
+  choose?: PreflightOption;
+  expires_at: string;
+  attestation?: unknown;
+  service?: Record<string, unknown>;
+}
+
+export interface Paid {
+  url: string;
+  /** false when the seller refused the payment (nothing was settled) */
+  paid: boolean;
+  status: number;
+  /** settlement transaction hash from the PAYMENT-RESPONSE header */
+  tx?: string;
+  network?: string;
+  payer?: string;
+  usd: number;
+  response: Response;
+}
+
+export interface GuardOptions {
+  /** alalanet base URL (default https://alalanet.com) */
+  api?: string;
+  /** optional alalanet bearer token for higher limits */
+  token?: string;
+  /** options above this price are blocked by alalanet */
+  maxUsdPerCall?: number;
+  /** rolling 24 h budget kept in memory by this guard */
+  maxUsdPerDay?: number;
+  /** never pay these hosts ("api.example.com" or "*.example.com") */
+  denyHosts?: string[];
+  /** if set, pay only these hosts */
+  allowHosts?: string[];
+  /** what to do with "hold" options (default "block") */
+  onHold?: "block" | "allow";
+  /** if alalanet cannot be reached: pass the 402 through (true) or refuse to pay (false, default) */
+  failOpen?: boolean;
+  /** fetch used to call alalanet (default: globalThis.fetch) */
+  fetch?: typeof fetch;
+  onDecision?(d: Decision): void;
+  /** called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
+  onPaid?(p: Paid): void | Promise<void>;
+}
+
+export declare class X402GuardError extends Error {
+  code: "blocked" | "held" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable" | "bad_402";
+  url?: string;
+  decision?: string;
+  reasons?: string[];
+  verdict?: Decision;
+}
+
+export declare function guardFetch(inner: typeof fetch, opts?: GuardOptions): typeof fetch;
