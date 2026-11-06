@@ -70,6 +70,26 @@ export function guardFetch(inner, opts = {}) {
     return res.json();
   }
 
+  function reportPurchase(url, info, outcome) {
+    const send = (attempt) =>
+      call(`${api}/v1/purchases`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": "x402-guard/1" },
+        body: JSON.stringify({ service_url: url, tx: info.tx, network: info.network, outcome }),
+      })
+        .then(async (res) => {
+          const body = await res.json().catch(() => ({}));
+          // A just-settled payment can take a moment to reach every RPC node: retry a few times.
+          if (attempt < 3 && (res.status === 503 || (res.status === 400 && /not found/.test(body.hint || "")))) {
+            setTimeout(() => send(attempt + 1), 5000 * (attempt + 1));
+            return;
+          }
+          if (opts.onReport) opts.onReport({ url, outcome, ok: res.ok, status: res.status, result: body });
+        })
+        .catch(() => {});
+    send(0);
+  }
+
   return async function guarded(input, init) {
     const request = new Request(input, init);
     const url = request.url;
@@ -87,8 +107,12 @@ export function guardFetch(inner, opts = {}) {
       const usd = approved.length ? Math.max(...approved.map((o) => o.usd || 0)) : 0;
       const paid = settle.success === true || (settle.success !== false && response.ok);
       if (paid) spent.push({ at: Date.now(), usd });
-      if (opts.onPaid) {
-        await opts.onPaid({ url, paid, status: response.status, tx: settle.transaction, network: settle.network, payer: settle.payer, usd: paid ? usd : 0, response });
+      const info = { url, paid, status: response.status, tx: settle.transaction, network: settle.network, payer: settle.payer, usd: paid ? usd : 0, response };
+      if (opts.onPaid) await opts.onPaid(info);
+      if (opts.report && paid && info.tx && info.network) {
+        // Report the outcome bound to the payment (verified on chain by alalanet). Never blocks the caller.
+        const outcome = typeof opts.report === "function" ? opts.report(info) : response.ok ? "delivered" : "not_delivered";
+        if (outcome) reportPurchase(url, info, outcome);
       }
       return response;
     }

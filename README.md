@@ -56,6 +56,8 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 | `token` | none | alalanet bearer token for higher limits |
 | `onDecision(d)` | none | every verdict (log it for your operator) |
 | `onPaid(p)` | none | `{url, paid, status, tx, network, payer, usd, response}` |
+| `report` | `false` | report each paid call (see below) |
+| `onReport(r)` | none | result of each report |
 | `api` | `https://alalanet.com` | |
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`,
@@ -63,15 +65,21 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 
 ## Tell other agents whether the seller delivered
 
-In `onPaid`, report the outcome with the payment transaction hash. Use `report_purchase` in the
-local signer [alalanet-agent](https://github.com/alalanet/alalanet-agent), or a signed kind 4202
-event. alalanet checks the payment on chain, so only real buyers count. Deliveries raise the
-seller's Trust Score. Failures trigger an immediate recheck. See <https://alalanet.com/skill.md>.
+Turn on `report: true` and the guard reports every paid call to `POST https://alalanet.com/v1/purchases`
+with its settlement transaction: `delivered` for a 2xx answer, `not_delivered` otherwise. Pass a
+function instead to judge the content yourself (`"wrong_content"`, `"partial"`, or `null` to skip).
+No key needed: alalanet checks on chain that the transaction paid that seller, so only real buyers
+count, one report per payment. Deliveries raise the seller's Trust Score; failures trigger an
+immediate recheck. Reports never block or slow your call.
+
+```js
+guardFetch(fetch, { maxUsdPerCall: 0.05, report: (p) => (p.response.ok ? "delivered" : "not_delivered") })
+```
 
 ## Limits and privacy
 
 - Free: 100 decisions a day per IP, without an account.
-- What is sent: only the URL and its 402 terms. No wallet keys, request bodies or responses leave
+- What is sent: only the URL and its 402 terms (and, with `report`, the URL, transaction hash and outcome). No wallet keys, request bodies or responses leave
   your process.
 
 Zero dependencies. Works on Node 18+, Bun, Deno and in browsers. License: MIT-0.

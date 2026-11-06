@@ -104,3 +104,23 @@ test("refused payment is reported as not paid and costs nothing", async () => {
   assert.equal(seen[0].usd, 0);
   await g(URL1); // budget untouched
 });
+
+test("report: true sends the outcome bound to the settlement tx", async () => {
+  const s = server({ accepts: [good] });
+  const reports = [];
+  const a = alalanet(() => ({ decision: "allow" }));
+  const api = async (url, init) => {
+    if (url.endsWith("/v1/purchases")) {
+      reports.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: "r1" }), { status: 201 });
+    }
+    return a.f(url, init);
+  };
+  const done = new Promise((resolve) => {
+    const g = guardFetch(s.inner, { fetch: api, report: true, onReport: resolve });
+    g(URL1).then(() => g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } }));
+  });
+  const r = await done;
+  assert.equal(r.ok, true);
+  assert.deepEqual(reports[0], { service_url: URL1, tx: "0xtx", network: "eip155:8453", outcome: "delivered" });
+});

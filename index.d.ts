@@ -53,6 +53,13 @@ export interface GuardOptions {
   /** fetch used to call alalanet (default: globalThis.fetch) */
   fetch?: typeof fetch;
   onDecision?(d: Decision): void;
+  /**
+   * Report each paid call to alalanet (POST /v1/purchases, verified on chain; no key needed).
+   * true: "delivered" for 2xx, "not_delivered" otherwise. A function returns the outcome
+   * ("delivered" | "partial" | "wrong_content" | "not_delivered") or null to skip.
+   */
+  report?: boolean | ((p: Paid) => "delivered" | "partial" | "wrong_content" | "not_delivered" | null | undefined);
+  onReport?(r: { url: string; outcome: string; ok: boolean; status: number; result: unknown }): void;
   /** called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
   onPaid?(p: Paid): void | Promise<void>;
 }
