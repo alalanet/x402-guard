@@ -1,5 +1,5 @@
 {
-  "name": "x402-guard",
+  "name": "@alalanet/x402-guard",
   "version": "1.0.0",
   "description": "Fetch wrapper that asks alalanet before an x402 payment is signed: blocks unknown payTo, bait-and-switch prices and sanctioned addresses; per-call and daily budgets; host allow/deny lists.",
   "type": "module",

@@ -1,5 +1,9 @@
 # x402-guard
 
+```
+npm i @alalanet/x402-guard
+```
+
 A `fetch` wrapper that asks [alalanet](https://alalanet.com) **before** your agent signs an x402
 payment. Your payer only ever sees the payment options alalanet allowed, within your budget.
 
@@ -9,7 +13,7 @@ check sits in the payment path.
 ```js
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
-import { guardFetch } from "x402-guard";
+import { guardFetch } from "@alalanet/x402-guard";
 
 const client = new x402Client();
 registerExactEvmScheme(client, { signer: account });
