@@ -46,6 +46,35 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 4. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
    The daily budget counts what was paid.
 
+## Never pay twice
+
+A paid call can time out, or get a 5xx or an unclear answer, after the facilitator has already
+settled it. If the retry signs a fresh payment, you pay twice. Released x402 clients do this (x402
+[#3438](https://github.com/x402-foundation/x402/issues/3438),
+[#4094](https://github.com/x402-foundation/x402/pull/4094)). The guard prevents it with any
+`@x402/fetch` version:
+
+- **Holds the signed payment per purchase** (method + URL + body). On a retry it sends the **same**
+  payment again, not the newly signed one. This is safe: an EIP-3009 authorization settles at most
+  once, and a Solana transaction with the same blockhash lands at most once.
+- **When the payment's validity window has closed**, it asks alalanet before a new payment may go
+  out. alalanet answers with `GET /v1/payment-status`, read on chain: EVM by `from` + `nonce` +
+  `validBefore`, Solana by payer + blockhash.
+  - **Paid already:** the guard throws `already_paid` with the tx. Ask the seller to deliver for that
+    payment.
+  - **Expired unused:** the new payment goes out.
+  - **Anything unclear:** the guard throws `payment_outcome_unknown` and signs nothing.
+- **A definite refusal ends the hold.** That means a facilitator error code such as
+  `insufficient_funds` with no transaction. `settlement_pending` and "nonce already used" do not end
+  it.
+
+Reproduce it with [examples/double-pay.mjs](examples/double-pay.mjs): a local seller settles the
+first paid call but answers 502, and the caller retries. With `@x402/fetch` 2.30.0 alone the seller
+receives 2 distinct authorizations, so you pay twice. With the guard it receives 1, sent twice.
+
+This is on by default (`holdPayments: false` turns it off). Only the payer address, the nonce or
+blockhash, and the expiry are sent to alalanet, never the signature.
+
 ## Options
 
 | option | default | |
@@ -58,6 +87,7 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 | `onAdvisory(list)` | `console.warn` | called once if your payment library has known flaws |
 | `allowHosts` / `denyHosts` | none | `"api.example.com"` or `"*.example.com"` |
 | `onHold` | `"block"` | `"allow"` to pay options on hold |
+| `holdPayments` | `true` | hold and re-present signed payments on retries; reconcile on chain before a new one |
 | `failOpen` | `false` | if alalanet is unreachable: `false` refuses to pay, `true` passes the 402 through |
 | `token` | none | alalanet bearer token for higher limits |
 | `onDecision(d)` | none | every verdict (log it for your operator) |
@@ -67,7 +97,7 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 | `api` | `https://alalanet.com` | |
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`,
-`over_budget`, `alalanet_unreachable` or `bad_402`. `reasons` lists alalanet's reasons.
+`over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid` or `payment_outcome_unknown`. `reasons` lists alalanet's reasons.
 
 ## Known flaws in your payment library
 

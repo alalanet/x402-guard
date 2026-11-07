@@ -87,10 +87,49 @@ export interface GuardOptions {
   onReport?(r: { url: string; outcome: string; ok: boolean; status: number; result: unknown }): void;
   /** called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
   onPaid?(p: Paid): void | Promise<void>;
+  /**
+   * Double-pay protection (default true): hold the signed payment per purchase (method + URL + body)
+   * and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read on
+   * chain) before a new payment may be signed. Set false to disable.
+   */
+  holdPayments?: boolean;
+  /** called when a retry re-presents the held payment instead of a newly signed one */
+  onRepresent?(e: { url: string; info: PaymentInfo }): void;
+  /** called with alalanet's payment_status answer when the hold window has closed */
+  onReconcile?(e: { url: string; status: PaymentStatus }): void;
 }
 
+export interface PaymentInfo {
+  kind: "evm" | "svm";
+  network: string;
+  /** payer wallet */
+  from: string;
+  /** EVM exact: EIP-3009 nonce and validBefore (unix seconds) */
+  nonce?: string;
+  validBefore?: number;
+  asset?: string;
+  /** Solana exact: recent blockhash of the signed transaction */
+  blockhash?: string;
+}
+
+export interface PaymentStatus {
+  network: string;
+  tx?: string;
+  state: "settled" | "failed" | "pending" | "not_settled" | "expired_unsettled";
+  retry: "do_not_pay_again" | "resend_same" | "new_payment_ok" | "wait";
+  safe_to_sign_new: boolean;
+  advice: string;
+}
+
+/** what the guard reads from a PAYMENT-SIGNATURE / X-PAYMENT value; null if it cannot be read */
+export declare function paymentInfo(headerValue: string): PaymentInfo | null;
+export declare function solanaPaymentInfo(txBase64: string): { signers: string[]; feePayer: string; blockhash: string };
+
 export declare class X402GuardError extends Error {
-  code: "blocked" | "held" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable" | "bad_402";
+  code: "blocked" | "held" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable" | "bad_402" | "already_paid" | "payment_outcome_unknown";
+  /** already_paid: the settlement transaction of the earlier payment */
+  tx?: string;
+  status?: PaymentStatus;
   url?: string;
   decision?: string;
   reasons?: string[];

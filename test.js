@@ -155,3 +155,103 @@ test("client is sent and advisories are surfaced once", async () => {
   assert.equal(adv.length, 1);
   assert.equal(adv[0][0].id, "ALN-2026-001");
 });
+
+// --- double-pay protection -----------------------------------------------------------------------
+import { paymentInfo, solanaPaymentInfo } from "./index.js";
+
+const evmPay = (nonce, validBefore) =>
+  b64({ x402Version: 2, accepted: { ...good, maxTimeoutSeconds: 60 }, payload: { signature: "0xsig" + nonce, authorization: { from: "0xme", nonce, validBefore: String(validBefore) } } });
+
+function flaky(script) {
+  // script: list of behaviours for paid requests: "timeout" | "502" | "ok" | "reject"
+  const paid = [];
+  const inner = async (req) => {
+    if (!req.headers.has("PAYMENT-SIGNATURE")) return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+    paid.push(req.headers.get("PAYMENT-SIGNATURE"));
+    const step = script.shift();
+    if (step === "timeout") throw new Error("timeout");
+    if (step === "502") return new Response("bad gateway", { status: 502 });
+    if (step === "reject")
+      return new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) } });
+    return new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx", network: "eip155:8453" }) } });
+  };
+  return { inner, paid };
+}
+
+function statusApi(answer) {
+  const asked = [];
+  const f = async (url) => {
+    asked.push(String(url));
+    return new Response(JSON.stringify(answer), { status: 200 });
+  };
+  return { f, asked };
+}
+
+test("a retry after a timeout re-presents the held payment instead of a new one", async () => {
+  const s = flaky(["timeout", "ok"]);
+  const api = statusApi({});
+  const g = guardFetch(s.inner, { fetch: api.f });
+  const vb = Math.floor(Date.now() / 1000) + 60;
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", vb) } }));
+  const r = await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", vb) } }); // the payer signed anew
+  assert.equal(r.status, 200);
+  assert.deepEqual(s.paid.map((p) => unb64(p).payload.authorization.nonce), ["0x01", "0x01"], "same authorization sent twice, never a second one");
+  assert.equal(api.asked.length, 0, "no chain read needed inside the window");
+});
+
+test("after the window: settled on chain means no second payment", async () => {
+  const s = flaky(["502"]);
+  const api = statusApi({ state: "settled", retry: "do_not_pay_again", safe_to_sign_new: false, tx: "0xpaid" });
+  const g = guardFetch(s.inner, { fetch: api.f });
+  const past = Math.floor(Date.now() / 1000) - 1;
+  const r = await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", past) } });
+  assert.equal(r.status, 502);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", past + 120) } }), (e) => e.code === "already_paid" && e.tx === "0xpaid");
+  assert.equal(s.paid.length, 1, "the second authorization never left");
+  assert.match(api.asked[0], /payment-status\?.*nonce=0x01.*valid_before=/);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x03", past + 120) } }), (e) => e.code === "already_paid");
+});
+
+test("after the window: an expired, unused authorization allows a new payment", async () => {
+  const s = flaky(["502", "ok"]);
+  const api = statusApi({ state: "expired_unsettled", retry: "new_payment_ok", safe_to_sign_new: true });
+  const g = guardFetch(s.inner, { fetch: api.f });
+  const past = Math.floor(Date.now() / 1000) - 1;
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", past) } });
+  const r = await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", past + 120) } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(s.paid.map((p) => unb64(p).payload.authorization.nonce), ["0x01", "0x02"]);
+});
+
+test("an unclear chain answer stops the payment instead of risking a second one", async () => {
+  const s = flaky(["502"]);
+  const g = guardFetch(s.inner, { fetch: async () => new Response("down", { status: 503 }) });
+  const past = Math.floor(Date.now() / 1000) - 1;
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", past) } });
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", past + 120) } }), (e) => e.code === "payment_outcome_unknown");
+  assert.equal(s.paid.length, 1);
+});
+
+test("a definite facilitator rejection releases the hold; other purchases are independent", async () => {
+  const s = flaky(["reject", "ok", "ok"]);
+  const g = guardFetch(s.inner, { fetch: statusApi({}).f });
+  const vb = Math.floor(Date.now() / 1000) + 60;
+  const r1 = await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", vb) } });
+  assert.equal(r1.status, 402);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", vb) } });
+  await g(URL1, { method: "POST", body: "other", headers: { "PAYMENT-SIGNATURE": evmPay("0x03", vb) } });
+  assert.deepEqual(s.paid.map((p) => unb64(p).payload.authorization.nonce), ["0x01", "0x02", "0x03"]);
+});
+
+test("solana payments are identified by signer and blockhash", () => {
+  const key = (n) => new Uint8Array(32).fill(n);
+  const parts = [Uint8Array.of(2), new Uint8Array(128), Uint8Array.of(2, 0, 1), Uint8Array.of(3), key(1), key(2), key(3), key(9), Uint8Array.of(0)];
+  const tx = Buffer.concat(parts.map((p) => Buffer.from(p))).toString("base64");
+  const info = solanaPaymentInfo(tx);
+  assert.equal(info.signers.length, 1);
+  assert.equal(info.signers[0], "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR"); // base58 of 32 x 0x02
+  assert.equal(info.blockhash, "cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN");
+  const p = paymentInfo(b64({ x402Version: 2, accepted: { network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" }, payload: { transaction: tx } }));
+  assert.equal(p.kind, "svm");
+  assert.equal(p.from, info.signers[0]);
+});
