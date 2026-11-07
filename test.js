@@ -124,3 +124,34 @@ test("report: true sends the outcome bound to the settlement tx", async () => {
   assert.equal(r.ok, true);
   assert.deepEqual(reports[0], { service_url: URL1, tx: "0xtx", network: "eip155:8453", outcome: "delivered" });
 });
+
+test("per-host daily budget leaves other hosts alone", async () => {
+  const s = server({ accepts: [good] });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerHostPerDay: 0.002, detectClient: false });
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget" && /shop\.example/.test(e.message));
+  const r = await g("https://other.example/paid");
+  assert.equal(r.status, 402);
+  assert.ok(Math.abs(a.calls.at(-1).max_usd - 0.002) < 1e-9);
+});
+
+test("client is sent and advisories are surfaced once", async () => {
+  const s = server({ accepts: [good] });
+  const calls = [];
+  const adv = [];
+  const api = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    const options = [{ network: "base", asset: good.asset, amount: good.amount, pay_to: good.payTo, usd: 0.002, decision: "allow" }];
+    const client_advisories = [{ id: "ALN-2026-001", package: "@x402/fetch", fixed_in: "2.23.0", severity: "critical", summary: "no default spending limit" }];
+    return new Response(JSON.stringify({ decision: "allow", options, expires_at: "x", client_advisories }), { status: 200 });
+  };
+  const g = guardFetch(s.inner, { fetch: api, client: "@x402/fetch@2.20.0", onAdvisory: (a) => adv.push(a) });
+  await g(URL1);
+  await g(URL1);
+  assert.equal(calls[0].client, "@x402/fetch@2.20.0");
+  assert.equal(adv.length, 1);
+  assert.equal(adv[0][0].id, "ALN-2026-001");
+});

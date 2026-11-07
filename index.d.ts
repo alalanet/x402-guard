@@ -18,6 +18,20 @@ export interface Decision {
   expires_at: string;
   attestation?: unknown;
   service?: Record<string, unknown>;
+  /** known flaws of the payment library you declared (client); not signed, not logged */
+  client_advisories?: Advisory[];
+}
+
+export interface Advisory {
+  id: string;
+  package: string;
+  below: string;
+  from?: string;
+  severity: "critical" | "high" | "medium";
+  summary: string;
+  fixed_in: string;
+  source: string;
+  published: string;
 }
 
 export interface Paid {
@@ -42,6 +56,17 @@ export interface GuardOptions {
   maxUsdPerCall?: number;
   /** rolling 24 h budget kept in memory by this guard */
   maxUsdPerDay?: number;
+  /** rolling 24 h budget per seller host, kept in memory by this guard */
+  maxUsdPerHostPerDay?: number;
+  /**
+   * your x402 payment library and version, e.g. "@x402/fetch@2.23.0" (comma-separated for several).
+   * Default: detected from the installed @x402/* packages (Node only). alalanet warns about known flaws.
+   */
+  client?: string;
+  /** set false to skip detecting installed @x402/* versions */
+  detectClient?: boolean;
+  /** called once with known flaws of your payment library (default: console.warn) */
+  onAdvisory?(advisories: Advisory[]): void;
   /** never pay these hosts ("api.example.com" or "*.example.com") */
   denyHosts?: string[];
   /** if set, pay only these hosts */

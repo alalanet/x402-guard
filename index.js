@@ -27,6 +27,38 @@ function b64encode(s) {
   return typeof btoa === "function" ? btoa(bin) : Buffer.from(bin, "binary").toString("base64");
 }
 
+// Best effort, Node only: the versions of the x402 payment libraries installed next to the guard,
+// so alalanet can warn about known flaws (their fixes shipped without advisories; npm audit is silent).
+let detected;
+async function detectClient() {
+  if (detected !== undefined) return detected;
+  detected = "";
+  try {
+    if (typeof process === "undefined" || !process.versions?.node) return detected;
+    const { createRequire } = await import("node:module");
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
+    const req = createRequire(join(process.cwd(), "noop.js"));
+    const found = [];
+    for (const name of ["@x402/fetch", "@x402/axios", "@x402/core", "@x402/extensions", "@x402/svm"]) {
+      try {
+        let dir = dirname(req.resolve(name));
+        for (let i = 0; i < 6; i++, dir = dirname(dir)) {
+          const pj = join(dir, "package.json");
+          if (!existsSync(pj)) continue;
+          const j = JSON.parse(readFileSync(pj, "utf8"));
+          if (j.name === name && j.version) {
+            found.push(`${name}@${j.version}`);
+            break;
+          }
+        }
+      } catch {}
+    }
+    detected = found.join(",");
+  } catch {}
+  return detected;
+}
+
 function hostMatches(host, patterns) {
   return (patterns || []).some((p) => {
     p = String(p).toLowerCase();
@@ -51,13 +83,14 @@ export function guardFetch(inner, opts = {}) {
   const api = (opts.api || "https://alalanet.com").replace(/\/$/, "");
   const call = opts.fetch || globalThis.fetch.bind(globalThis);
   const onHold = opts.onHold || "block";
-  const spent = []; // [{at, usd}]
+  const spent = []; // [{at, usd, host}]
+  let warned = false;
   const pending = new Map(); // url -> allowed options from the last preflight
 
-  const spentToday = () => {
+  const spentToday = (host) => {
     const now = Date.now();
     while (spent.length && now - spent[0].at > DAY_MS) spent.shift();
-    return spent.reduce((s, x) => s + x.usd, 0);
+    return spent.filter((x) => host === undefined || x.host === host).reduce((s, x) => s + x.usd, 0);
   };
 
   async function preflight(url, paymentRequired, maxUsd) {
@@ -65,9 +98,21 @@ export function guardFetch(inner, opts = {}) {
     if (opts.token) headers.authorization = `Bearer ${opts.token}`;
     const body = { url, payment_required: paymentRequired };
     if (maxUsd !== undefined) body.max_usd = maxUsd;
+    const client = opts.client ?? (opts.detectClient === false ? "" : await detectClient());
+    if (client) body.client = client;
     const res = await call(`${api}/v1/preflight`, { method: "POST", headers, body: JSON.stringify(body) });
     if (!res.ok) throw new Error(`alalanet preflight HTTP ${res.status}`);
-    return res.json();
+    const verdict = await res.json();
+    if (verdict.client_advisories?.length && !warned) {
+      warned = true;
+      if (opts.onAdvisory) opts.onAdvisory(verdict.client_advisories);
+      else
+        console.warn(
+          "x402-guard: your x402 payment library has known flaws, update it: " +
+            verdict.client_advisories.map((a) => `${a.package} < ${a.fixed_in} (${a.severity}): ${a.summary}`).join(" | "),
+        );
+    }
+    return verdict;
   }
 
   function reportPurchase(url, info, outcome) {
@@ -106,7 +151,7 @@ export function guardFetch(inner, opts = {}) {
       pending.delete(url);
       const usd = approved.length ? Math.max(...approved.map((o) => o.usd || 0)) : 0;
       const paid = settle.success === true || (settle.success !== false && response.ok);
-      if (paid) spent.push({ at: Date.now(), usd });
+      if (paid) spent.push({ at: Date.now(), usd, host: new URL(url).hostname.toLowerCase() });
       const info = { url, paid, status: response.status, tx: settle.transaction, network: settle.network, payer: settle.payer, usd: paid ? usd : 0, response };
       if (opts.onPaid) await opts.onPaid(info);
       if (opts.report && paid && info.tx && info.network) {
@@ -132,6 +177,11 @@ export function guardFetch(inner, opts = {}) {
     if (opts.maxUsdPerDay !== undefined) {
       const left = opts.maxUsdPerDay - spentToday();
       if (left <= 0) throw new X402GuardError("over_budget", "x402-guard: daily budget spent", { url });
+      maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
+    }
+    if (opts.maxUsdPerHostPerDay !== undefined) {
+      const left = opts.maxUsdPerHostPerDay - spentToday(host);
+      if (left <= 0) throw new X402GuardError("over_budget", `x402-guard: daily budget for ${host} spent`, { url });
       maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
     }
 

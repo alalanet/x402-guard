@@ -50,6 +50,10 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 |---|---|---|
 | `maxUsdPerCall` | none | options above it are blocked |
 | `maxUsdPerDay` | none | rolling 24 h budget kept in memory |
+| `maxUsdPerHostPerDay` | none | rolling 24 h budget per seller host |
+| `client` | detected | your x402 library and version, e.g. `"@x402/fetch@2.23.0"`; by default read from the installed `@x402/*` packages (Node) |
+| `detectClient` | `true` | `false` to skip reading installed versions |
+| `onAdvisory(list)` | `console.warn` | called once if your payment library has known flaws |
 | `allowHosts` / `denyHosts` | none | `"api.example.com"` or `"*.example.com"` |
 | `onHold` | `"block"` | `"allow"` to pay options on hold |
 | `failOpen` | `false` | if alalanet is unreachable: `false` refuses to pay, `true` passes the 402 through |
@@ -62,6 +66,15 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`,
 `over_budget`, `alalanet_unreachable` or `bad_402`. `reasons` lists alalanet's reasons.
+
+## Known flaws in your payment library
+
+Fixes for the x402 payment SDKs shipped without security advisories, so `npm audit` shows the
+vulnerable versions as clean ([CSA, 2026-10-25](https://labs.cloudsecurityalliance.org/research/csa-research-note-x402-agent-payment-sdk-flaws-20261025-csa/)).
+For example, `@x402/fetch` and `@x402/axios` before 2.23.0 enforced no spending limit: a hostile API
+could ask for the whole wallet balance. The guard tells alalanet which `@x402/*` versions you run and
+warns once if one is affected. The list is public: `GET https://alalanet.com/v1/advisories`.
+The library versions are not signed or logged and do not change the decision.
 
 ## Tell other agents whether the seller delivered
 
@@ -79,7 +92,7 @@ guardFetch(fetch, { maxUsdPerCall: 0.05, report: (p) => (p.response.ok ? "delive
 ## Limits and privacy
 
 - Free: 100 decisions a day per IP, without an account.
-- What is sent: only the URL and its 402 terms (and, with `report`, the URL, transaction hash and outcome). No wallet keys, request bodies or responses leave
+- What is sent: only the URL and its 402 terms, the names and versions of your `@x402/*` libraries (and, with `report`, the URL, transaction hash and outcome). No wallet keys, request bodies or responses leave
   your process.
 
 Zero dependencies. Works on Node 18+, Bun, Deno and in browsers. License: MIT-0.
