@@ -1,17 +1,42 @@
 {
   "name": "@alalanet/x402-guard",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Fetch wrapper that asks alalanet before an x402 payment is signed: blocks unknown payTo, bait-and-switch prices and sanctioned addresses; per-call, daily and per-seller budgets; warns about x402 SDK versions with known flaws; host allow/deny lists.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
-  "exports": { ".": { "types": "./index.d.ts", "default": "./index.js" } },
-  "files": ["index.js", "index.d.ts", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
-  "scripts": { "test": "node --test test.js" },
-  "keywords": ["x402", "payments", "ai-agents", "agent-security", "fetch", "preflight", "alalanet"],
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test.js"
+  },
+  "keywords": [
+    "x402",
+    "payments",
+    "ai-agents",
+    "agent-security",
+    "fetch",
+    "preflight",
+    "alalanet"
+  ],
   "homepage": "https://alalanet.com",
-  "repository": { "type": "git", "url": "git+https://github.com/alalanet/x402-guard.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alalanet/x402-guard.git"
+  },
   "license": "MIT-0",
   "author": "alalanet <noreply@alalanet.com>"
 }

@@ -31,10 +31,12 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 
 1. The guard sends the endpoint URL and its 402 terms to `POST https://alalanet.com/v1/preflight`.
 2. alalanet judges each payment option:
-   - **block**: payTo differs from the listing, payTo is on the OFAC list, the service is down, or the
-     price is over your budget;
-   - **hold**: the price is above the listing, the network or asset is not listed, the trust score is
-     low, or the service is unknown;
+   - **block**: the payTo is unknown, on the OFAC list or frozen by the stablecoin issuer, the service
+     is not working, or the price is over your budget;
+   - **hold**: the payTo differs from the listing or was never seen, the price is above the listing or
+     what alalanet observed, the network or asset is not listed, the price is high, the trust score is
+     low, or the service is unknown or not checked yet. By default the guard treats hold like block;
+     set `onHold: "allow"` to pay options on hold;
    - **allow**: otherwise.
 
    The decision is signed and written to a public log. It records the endpoint, the terms and the
