@@ -70,10 +70,10 @@ test("paid response is reported and counted against the daily budget", async () 
   assert.equal(paid[0].tx, "0xtx");
   assert.equal(paid[0].usd, 0.002);
   assert.equal(paid[0].paid, true);
-  await g(URL1);
-  assert.ok(Math.abs(a.calls[1].max_usd - 0.001) < 1e-9, "remaining budget passed as max_usd");
-  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
+  // 0.001 left: an option at 0.002 is refused here even if the verdict allowed it (this stand-in
+  // alalanet ignores max_usd; the guard used to pay it and overspend the day)
   await assert.rejects(g(URL1), (e) => e.code === "over_budget");
+  assert.ok(Math.abs(a.calls[1].max_usd - 0.001) < 1e-9, "remaining budget passed as max_usd");
 });
 
 test("host lists and fail-closed", async () => {
@@ -254,4 +254,20 @@ test("solana payments are identified by signer and blockhash", () => {
   const p = paymentInfo(b64({ x402Version: 2, accepted: { network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" }, payload: { transaction: tx } }));
   assert.equal(p.kind, "svm");
   assert.equal(p.from, info.signers[0]);
+});
+
+test("an allowed option over the budget is not paid even if alalanet allowed it", async () => {
+  const s = server({ accepts: [{ ...good, amount: "9000" }] });
+  const a = alalanet(() => ({ decision: "allow" })); // a verdict that ignored max_usd
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerCall: 0.005 });
+  await assert.rejects(g(URL1), (e) => e instanceof X402GuardError && e.code === "over_budget");
+  assert.equal(a.calls[0].max_usd, 0.005);
+});
+
+test("an option without a known USD price is not paid when a budget is set", async () => {
+  const s = server({ accepts: [good] });
+  const a = alalanet(() => ({ decision: "allow", usd: undefined }));
+  await assert.rejects(guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 1 })(URL1), (e) => e.code === "over_budget");
+  const r = await guardFetch(server({ accepts: [good] }).inner, { fetch: a.f })(URL1); // no budget
+  assert.equal(r.status, 402);
 });

@@ -4,11 +4,68 @@
 npm i @alalanet/x402-guard
 ```
 
-A `fetch` wrapper that asks [alalanet](https://alalanet.com) **before** your agent signs an x402
-payment. Your payer only ever sees the payment options alalanet allowed, within your budget.
+Asks [alalanet](https://alalanet.com) **before** your agent signs an x402 payment. Without it, a
+"check before you pay" step is just an MCP tool the model may skip. With it, the check sits in the
+payment path.
 
-Without it, a "check before you pay" step is just an MCP tool the model may skip. With it, the
-check sits in the payment path.
+## In the official x402 client (one line)
+
+`@x402/core`'s `x402Client` runs `onBeforePaymentCreation` before any payment is signed, and
+`@x402/fetch`, `@x402/axios` and `@x402/mcp` create every payment through it. `alalanetGuard` adds
+that hook (and `onPaymentCreationFailure`, for the budgets):
+
+```js
+import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { alalanetGuard } from "@alalanet/x402-guard";
+
+const client = new x402Client();
+registerExactEvmScheme(client, { signer: account });
+alalanetGuard(client, { maxUsdPerCall: 0.05, maxUsdPerDay: 2 });
+
+const pay = wrapFetchWithPayment(fetch, client);
+const res = await pay("https://api.example.com/paid?city=Lisbon");
+```
+
+A refused payment is never signed: the error message contains
+`Payment creation aborted: x402-guard <code>: <why>` (`@x402/fetch` puts
+`Failed to create payment payload:` in front), with `code` one of `blocked`, `held`, `over_budget`,
+`unchecked`, `denied_host`, `not_allowed_host` or `alalanet_unreachable`. The hook judges the option
+your client chose; if alalanet allows another one, the reason names it.
+
+Budgets in this mode: a payment counts from the moment it is approved, so parallel calls cannot all
+pass one budget. It is freed only if the client never created it (the signer failed), never on the
+seller's word: a seller could settle, answer "failed" and be paid again. A refused payment therefore
+stays counted for the 24 hours; the fetch wrapper, which reconciles on chain, counts only what was paid. A price
+alalanet cannot put in US dollars is refused when you set a budget. `allowHosts`, `denyHosts` and the
+per-seller budget apply to the URL the 402 names (the hook is not told which URL was fetched; a seller
+naming a host it does not own still has to match that host's listing at alalanet). Payments let through
+by `failOpen` or `onUnchecked: "allow"` are not checked and not counted.
+
+**Paid MCP tools** (`@x402/mcp`): a tool's 402 names the resource `mcp://tool/<name>`, which says
+nothing about whose server it is. Pass the server's URL so alalanet can check it, or the payment is
+refused (`unchecked`):
+
+```js
+alalanetGuard(client, { maxUsdPerCall: 0.05, resourceUrl: "https://tools.example.com/mcp" });
+```
+
+When a payment cannot be created (the signer or the scheme fails), the guard frees its share of the
+budget and stops there: failure hooks that would hand back a replacement payment for another option
+(`@x402/svm`'s batch scheme falls back to a different accept this way) would send it unchecked, so
+no replacement is made. Register `alalanetGuard` before failure hooks of your own.
+
+What the hook cannot see: an `@x402/mcp` `onPaymentRequired` hook of your own that returns a ready
+payment skips `createPaymentPayload`, and with it this check; an `onAfterPaymentCreation` hook of your
+own receives the signed payment and is trusted with it.
+
+To wire the hooks yourself: `const h = alalanetHooks(opts)`, then
+`client.onBeforePaymentCreation(h.onBeforePaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure)`.
+
+The hook cannot re-present an already signed payment when a paid call is retried. For that, and for
+automatic purchase reports, use the fetch wrapper below (not both: each would ask alalanet).
+
+## As a fetch wrapper (adds double-pay protection and reports)
 
 ```js
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
@@ -18,7 +75,8 @@ import { guardFetch } from "@alalanet/x402-guard";
 const client = new x402Client();
 registerExactEvmScheme(client, { signer: account });
 
-// The guard goes UNDER the payer: it sees each 402 before a payment is created.
+// The guard goes UNDER the payer: it sees each 402 before a payment is created, and your payer
+// only ever sees the payment options alalanet allowed, within your budget.
 const pay = wrapFetchWithPayment(
   guardFetch(fetch, { maxUsdPerCall: 0.05, maxUsdPerDay: 2 }),
   client,
@@ -87,14 +145,17 @@ blockhash, and the expiry are sent to alalanet, never the signature.
 | `onAdvisory(list)` | `console.warn` | called once if your payment library has known flaws |
 | `allowHosts` / `denyHosts` | none | `"api.example.com"` or `"*.example.com"` |
 | `onHold` | `"block"` | `"allow"` to pay options on hold |
-| `holdPayments` | `true` | hold and re-present signed payments on retries; reconcile on chain before a new one |
-| `failOpen` | `false` | if alalanet is unreachable: `false` refuses to pay, `true` passes the 402 through |
+| `holdPayments` | `true` | wrapper only: hold and re-present signed payments on retries; reconcile on chain before a new one |
+| `failOpen` | `false` | if alalanet is unreachable: `false` refuses to pay, `true` lets the payment go ahead unchecked |
 | `token` | none | alalanet bearer token for higher limits |
 | `onDecision(d)` | none | every verdict (log it for your operator) |
-| `onPaid(p)` | none | `{url, paid, status, tx, network, payer, usd, response}` |
-| `report` | `false` | report each paid call (see below) |
+| `onPaid(p)` | none | wrapper only: `{url, paid, status, tx, network, payer, usd, response}` |
+| `report` | `false` | wrapper only: report each paid call (see below) |
 | `onReport(r)` | none | result of each report |
 | `api` | `https://alalanet.com` | |
+| `resourceUrl` | none | hook only: the https URL of the paid service; a string when the 402 names none (paid MCP tools), a function `(ctx) => url` always decides |
+| `onUnchecked` | `"block"` | hook only: `"allow"` to let a payment through that has no https URL to check |
+| `onAbort(a)` | none | hook only: `{code, message, url, decision, reasons, verdict}` of each refused payment |
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`,
 `over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid` or `payment_outcome_unknown`. `reasons` lists alalanet's reasons.
@@ -124,6 +185,8 @@ guardFetch(fetch, { maxUsdPerCall: 0.05, report: (p) => (p.response.ok ? "delive
 ## Limits and privacy
 
 - Free: 100 decisions a day per IP, without an account.
+- In both modes an option over what is left of your budget is refused by the guard itself, even if
+  the verdict allowed it.
 - What is sent: only the URL and its 402 terms, the names and versions of your `@x402/*` libraries (and, with `report`, the URL, transaction hash and outcome). No wallet keys, request bodies or responses leave
   your process.
 

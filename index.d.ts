@@ -1,5 +1,7 @@
 export interface PreflightOption {
   network: string;
+  /** the option's network as the 402 spells it (eip155:8453); sent by alalanet since 2026-11-10 */
+  network_id?: string;
   asset: string;
   amount: string;
   price: string;
@@ -73,22 +75,26 @@ export interface GuardOptions {
   allowHosts?: string[];
   /** what to do with "hold" options (default "block") */
   onHold?: "block" | "allow";
-  /** if alalanet cannot be reached: pass the 402 through (true) or refuse to pay (false, default) */
+  /**
+   * if alalanet cannot be reached: refuse to pay (false, default) or let the payment go ahead unchecked
+   * (true: the wrapper passes the 402 through, the hook does not abort); such a payment is not counted
+   * against the hook's budgets
+   */
   failOpen?: boolean;
   /** fetch used to call alalanet (default: globalThis.fetch) */
   fetch?: typeof fetch;
   onDecision?(d: Decision): void;
   /**
-   * Report each paid call to alalanet (POST /v1/purchases, verified on chain; no key needed).
+   * Wrapper only. Report each paid call to alalanet (POST /v1/purchases, verified on chain; no key needed).
    * true: "delivered" for 2xx, "not_delivered" otherwise. A function returns the outcome
    * ("delivered" | "partial" | "wrong_content" | "not_delivered") or null to skip.
    */
   report?: boolean | ((p: Paid) => "delivered" | "partial" | "wrong_content" | "not_delivered" | null | undefined);
   onReport?(r: { url: string; outcome: string; ok: boolean; status: number; result: unknown }): void;
-  /** called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
+  /** wrapper only: called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
   onPaid?(p: Paid): void | Promise<void>;
   /**
-   * Double-pay protection (default true): hold the signed payment per purchase (method + URL + body)
+   * Wrapper only. Double-pay protection (default true): hold the signed payment per purchase (method + URL + body)
    * and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read on
    * chain) before a new payment may be signed. Set false to disable.
    */
@@ -137,3 +143,51 @@ export declare class X402GuardError extends Error {
 }
 
 export declare function guardFetch(inner: typeof fetch, opts?: GuardOptions): typeof fetch;
+
+/** Options for the official x402 client hook (alalanetGuard / alalanetHooks), besides GuardOptions. */
+export interface HookOptions {
+  /**
+   * The https URL of the paid service to check. A string is used when the 402 names no https URL (a
+   * paid MCP tool's resource is mcp://tool/<name> by default: pass your MCP server's URL). A function
+   * gets the payment context and decides, even over an https URL the 402 names.
+   */
+  resourceUrl?: string | ((ctx: { paymentRequired: unknown; selectedRequirements: unknown }) => string | undefined);
+  /** a payment without an https URL to check (also plain http:// sellers): refuse it (default "block") or let it through unchecked and uncounted */
+  onUnchecked?: "block" | "allow";
+  /** called when the hook refuses a payment; the client then throws "Payment creation aborted: x402-guard <code>: …" */
+  onAbort?(a: {
+    code: "blocked" | "held" | "unchecked" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable";
+    message: string;
+    url: string;
+    decision?: string;
+    reasons: string[];
+    verdict?: Decision;
+  }): void;
+}
+
+export interface GuardHooks {
+  /**
+   * for x402Client.onBeforePaymentCreation: judges the chosen option before it is signed; an approved
+   * payment counts against the budgets from this moment
+   */
+  onBeforePaymentCreation(ctx: { paymentRequired: any; selectedRequirements: any }): Promise<void | { abort: true; reason: string }>;
+  /** for x402Client.onPaymentCreationFailure: a payment that was never created frees its share of the budgets */
+  onPaymentCreationFailure(ctx: { paymentRequired: any; selectedRequirements: any; error: Error }): Promise<void>;
+}
+
+/**
+ * The hooks, to wire them yourself:
+ *   const h = alalanetHooks(opts);
+ *   client.onBeforePaymentCreation(h.onBeforePaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure);
+ */
+export declare function alalanetHooks(opts?: GuardOptions & HookOptions): GuardHooks;
+
+/**
+ * Plug alalanet into the official x402 client (@x402/core x402Client): every payment it is about to
+ * create is judged first, within your budgets. @x402/fetch, @x402/axios and @x402/mcp create payments
+ * through this client, so one line covers them. Returns the client.
+ */
+export declare function alalanetGuard<C extends {
+  onBeforePaymentCreation(hook: GuardHooks["onBeforePaymentCreation"]): unknown;
+  onPaymentCreationFailure(hook: GuardHooks["onPaymentCreationFailure"]): unknown;
+}>(client: C, opts?: GuardOptions & HookOptions): C;

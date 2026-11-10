@@ -1,7 +1,7 @@
 {
   "name": "@alalanet/x402-guard",
-  "version": "1.3.0",
-  "description": "Fetch wrapper that asks alalanet before an x402 payment is signed: blocks unknown payTo, bait-and-switch prices and sanctioned addresses; never pays twice for one purchase (re-presents the signed payment on retries, reconciles on chain); per-call, daily and per-seller budgets; warns about x402 SDK versions with known flaws.",
+  "version": "1.4.0",
+  "description": "Asks alalanet before an x402 payment is signed, in the official x402 client hook (one line for @x402/fetch, @x402/axios, @x402/mcp) or as a fetch wrapper: blocks unknown payTo, bait-and-switch prices and sanctioned addresses; per-call, daily and per-seller budgets; the wrapper also never pays twice for one purchase; warns about x402 SDK versions with known flaws.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -21,7 +21,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test.js"
+    "test": "node --test test.js test-hook.js"
   },
   "keywords": [
     "x402",
@@ -31,7 +31,9 @@
     "fetch",
     "preflight",
     "alalanet",
-    "double-pay"
+    "double-pay",
+    "x402-client",
+    "onBeforePaymentCreation"
   ],
   "homepage": "https://alalanet.com",
   "repository": {
@@ -39,5 +41,8 @@
     "url": "git+https://github.com/alalanet/x402-guard.git"
   },
   "license": "MIT-0",
-  "author": "alalanet <noreply@alalanet.com>"
+  "author": "alalanet <noreply@alalanet.com>",
+  "devDependencies": {
+    "@x402/core": "2.30.0"
+  }
 }

@@ -42,7 +42,7 @@ async function detectClient() {
     const { dirname, join } = await import("node:path");
     const req = createRequire(join(process.cwd(), "noop.js"));
     const found = [];
-    for (const name of ["@x402/fetch", "@x402/axios", "@x402/core", "@x402/extensions", "@x402/svm"]) {
+    for (const name of ["@x402/fetch", "@x402/axios", "@x402/core", "@x402/mcp", "@x402/extensions", "@x402/svm"]) {
       try {
         let dir = dirname(req.resolve(name));
         for (let i = 0; i < 6; i++, dir = dirname(dir)) {
@@ -173,6 +173,55 @@ function optionMatches(accept, allowed) {
   return allowed.some((o) => same(o.pay_to, accept.payTo) && same(o.asset, accept.asset) && String(o.amount) === String(amount));
 }
 
+const VERSION = "1.4";
+
+// Asks alalanet about one 402. mode ("fetch" or "hook") goes into the user agent, so alalanet can
+// count how often each way of plugging in is used (no other data about the caller).
+function makePreflight(opts, mode) {
+  const api = (opts.api || "https://alalanet.com").replace(/\/$/, "");
+  const call = opts.fetch || globalThis.fetch.bind(globalThis);
+  const ua = `x402-guard/${VERSION} (${mode})`;
+  let warned = false;
+  async function preflight(url, paymentRequired, maxUsd) {
+    const headers = { "content-type": "application/json", "user-agent": ua };
+    if (opts.token) headers.authorization = `Bearer ${opts.token}`;
+    const body = { url, payment_required: paymentRequired };
+    if (maxUsd !== undefined) body.max_usd = maxUsd;
+    const client = opts.client ?? (opts.detectClient === false ? "" : await detectClient());
+    if (client) body.client = client;
+    const res = await call(`${api}/v1/preflight`, { method: "POST", headers, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`alalanet preflight HTTP ${res.status}`);
+    const verdict = await res.json();
+    if (verdict.client_advisories?.length && !warned) {
+      warned = true;
+      if (opts.onAdvisory) opts.onAdvisory(verdict.client_advisories);
+      else
+        console.warn(
+          "x402-guard: your x402 payment library has known flaws, update it: " +
+            verdict.client_advisories.map((a) => `${a.package} < ${a.fixed_in} (${a.severity}): ${a.summary}`).join(" | "),
+        );
+    }
+    return verdict;
+  }
+  return { api, call, ua, preflight };
+}
+
+// What is left of the per-call, daily and per-seller budgets, or the code of the limit hit.
+function budgetLeft(opts, spentToday, host) {
+  let maxUsd = opts.maxUsdPerCall;
+  if (opts.maxUsdPerDay !== undefined) {
+    const left = opts.maxUsdPerDay - spentToday();
+    if (left <= 1e-9) return { over: "x402-guard: daily budget spent" };
+    maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
+  }
+  if (opts.maxUsdPerHostPerDay !== undefined) {
+    const left = opts.maxUsdPerHostPerDay - spentToday(host);
+    if (left <= 1e-9) return { over: `x402-guard: daily budget for ${host} spent` };
+    maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
+  }
+  return { maxUsd: maxUsd === undefined ? undefined : Math.round(maxUsd * 1e6) / 1e6 };
+}
+
 /**
  * Wrap fetch so that every x402 402 response is judged by alalanet before your payer signs.
  * @param {typeof fetch} inner the fetch your x402 payer would use
@@ -180,11 +229,9 @@ function optionMatches(accept, allowed) {
  * @returns {typeof fetch}
  */
 export function guardFetch(inner, opts = {}) {
-  const api = (opts.api || "https://alalanet.com").replace(/\/$/, "");
-  const call = opts.fetch || globalThis.fetch.bind(globalThis);
+  const { api, call, ua, preflight } = makePreflight(opts, "fetch");
   const onHold = opts.onHold || "block";
   const spent = []; // [{at, usd, host}]
-  let warned = false;
   const pending = new Map(); // url -> allowed options from the last preflight
   const holds = new Map(); // purchase key -> held payment {header, value, info, until, settledTx?}
   const SVM_WINDOW_MS = 60 * 1000; // a Solana blockhash is valid for about 60-90 s
@@ -201,7 +248,7 @@ export function guardFetch(inner, opts = {}) {
       if (info.validBefore) q.set("valid_before", String(info.validBefore));
       if (info.asset) q.set("asset", info.asset);
     } else q.set("blockhash", info.blockhash);
-    const headers = { "user-agent": "x402-guard/1" };
+    const headers = { "user-agent": ua };
     if (opts.token) headers.authorization = `Bearer ${opts.token}`;
     const res = await call(`${api}/v1/payment-status?${q}`, { headers });
     if (!res.ok) throw new Error(`alalanet payment-status HTTP ${res.status}`);
@@ -277,33 +324,11 @@ export function guardFetch(inner, opts = {}) {
     return spent.filter((x) => host === undefined || x.host === host).reduce((s, x) => s + x.usd, 0);
   };
 
-  async function preflight(url, paymentRequired, maxUsd) {
-    const headers = { "content-type": "application/json", "user-agent": "x402-guard/1" };
-    if (opts.token) headers.authorization = `Bearer ${opts.token}`;
-    const body = { url, payment_required: paymentRequired };
-    if (maxUsd !== undefined) body.max_usd = maxUsd;
-    const client = opts.client ?? (opts.detectClient === false ? "" : await detectClient());
-    if (client) body.client = client;
-    const res = await call(`${api}/v1/preflight`, { method: "POST", headers, body: JSON.stringify(body) });
-    if (!res.ok) throw new Error(`alalanet preflight HTTP ${res.status}`);
-    const verdict = await res.json();
-    if (verdict.client_advisories?.length && !warned) {
-      warned = true;
-      if (opts.onAdvisory) opts.onAdvisory(verdict.client_advisories);
-      else
-        console.warn(
-          "x402-guard: your x402 payment library has known flaws, update it: " +
-            verdict.client_advisories.map((a) => `${a.package} < ${a.fixed_in} (${a.severity}): ${a.summary}`).join(" | "),
-        );
-    }
-    return verdict;
-  }
-
   function reportPurchase(url, info, outcome) {
     const send = (attempt) =>
       call(`${api}/v1/purchases`, {
         method: "POST",
-        headers: { "content-type": "application/json", "user-agent": "x402-guard/1" },
+        headers: { "content-type": "application/json", "user-agent": ua },
         body: JSON.stringify({ service_url: url, tx: info.tx, network: info.network, outcome }),
       })
         .then(async (res) => {
@@ -370,17 +395,9 @@ export function guardFetch(inner, opts = {}) {
     const header = response.headers.get("PAYMENT-REQUIRED");
     if (!header && !text) throw new X402GuardError("bad_402", "x402-guard: 402 without payment terms", { url });
 
-    let maxUsd = opts.maxUsdPerCall;
-    if (opts.maxUsdPerDay !== undefined) {
-      const left = opts.maxUsdPerDay - spentToday();
-      if (left <= 0) throw new X402GuardError("over_budget", "x402-guard: daily budget spent", { url });
-      maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
-    }
-    if (opts.maxUsdPerHostPerDay !== undefined) {
-      const left = opts.maxUsdPerHostPerDay - spentToday(host);
-      if (left <= 0) throw new X402GuardError("over_budget", `x402-guard: daily budget for ${host} spent`, { url });
-      maxUsd = maxUsd === undefined ? left : Math.min(maxUsd, left);
-    }
+    const budget = budgetLeft(opts, spentToday, host);
+    if (budget.over) throw new X402GuardError("over_budget", budget.over, { url });
+    const maxUsd = budget.maxUsd;
 
     let verdict;
     try {
@@ -391,8 +408,14 @@ export function guardFetch(inner, opts = {}) {
     }
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
 
+    // alalanet blocks options above max_usd; the budget is also checked here, in case it did not
+    const affordable = (o) => maxUsd === undefined || (o.usd !== undefined && o.usd !== null && o.usd <= maxUsd + 1e-9);
     const ok = (o) => o.decision === "allow" || (o.decision === "hold" && onHold === "allow");
-    const allowed = (verdict.options || []).filter(ok);
+    const judged = (verdict.options || []).filter(ok);
+    const allowed = judged.filter(affordable);
+    if (judged.length && !allowed.length) {
+      throw new X402GuardError("over_budget", `x402-guard: every allowed option is over what is left of your budget (${maxUsd}); not paying ${url}`, { url, verdict });
+    }
     if (!allowed.length) {
       const reasons = [...new Set((verdict.options || []).flatMap((o) => o.reasons || []))];
       const code = verdict.decision === "hold" ? "held" : "blocked";
@@ -424,4 +447,140 @@ export function guardFetch(inner, opts = {}) {
     headers.delete("content-length");
     return new Response(body, { status: 402, statusText: response.statusText, headers });
   };
+}
+
+// --- the official x402 client hook ---------------------------------------------------------------
+// @x402/core's x402Client runs onBeforePaymentCreation before any payment is signed, and @x402/fetch,
+// @x402/axios and @x402/mcp all create payments through it: one line covers all three. The hook can
+// refuse a payment but cannot swap the option the client chose; an allowed alternative is named in
+// the reason. Re-presenting a signed payment on retries needs the transport: use guardFetch for that.
+
+/**
+ * The two hooks, for wiring them yourself. Most callers use alalanetGuard(client, opts).
+ * @param {import('./index').GuardOptions & import('./index').HookOptions} [opts]
+ */
+export function alalanetHooks(opts = {}) {
+  const { preflight } = makePreflight(opts, "hook");
+  const onHold = opts.onHold || "block";
+  // Every approved payment counts from the moment it is approved, so parallel payments cannot all
+  // pass one budget. It is never freed on the seller's word (a seller alalanet allows could settle,
+  // answer "failed" and be paid again and again): only when the payment was never created, which
+  // the client itself reports (onPaymentCreationFailure). The entry is bound to the option object
+  // the client chose, so a failure frees that payment and not another seller's.
+  const spent = []; // [{at, usd, host}]
+  const byOption = new WeakMap(); // selectedRequirements -> entries approved for it, newest last
+  // An unchecked payment (failOpen, onUnchecked: "allow") records a placeholder, so its failure
+  // cannot free the entry of an earlier payment made with the same option object.
+  const remember = (req, entry) => {
+    if (!req || typeof req !== "object") return;
+    if (!byOption.has(req)) byOption.set(req, []);
+    byOption.get(req).push(entry);
+  };
+
+  const spentToday = (host) => {
+    const now = Date.now();
+    while (spent.length && now - spent[0].at > DAY_MS) spent.shift();
+    return spent.filter((x) => host === undefined || x.host === host).reduce((s, x) => s + x.usd, 0);
+  };
+
+  const refuse = (code, message, details) => {
+    if (opts.onAbort) opts.onAbort({ code, reasons: [], ...details, message });
+    return { abort: true, reason: `x402-guard ${code}: ${message}` };
+  };
+
+  // The verdict for the option the client chose: by its network when alalanet names it, otherwise the
+  // strictest of the options with the same payTo, asset and amount.
+  const rank = { block: 0, hold: 1, allow: 2 };
+  function verdictFor(req, options) {
+    const exact = options.filter((o) => optionMatches(req, [o]) && (o.network_id === undefined || same(o.network_id, req.network)));
+    return exact.sort((a, b) => (rank[a.decision] ?? 0) - (rank[b.decision] ?? 0))[0];
+  }
+
+  async function onBeforePaymentCreation(ctx) {
+    const req = ctx.selectedRequirements;
+    const named = ctx.paymentRequired?.resource?.url || req.resource || "";
+    // A function is your own code and decides; a plain string fills in when the 402 names no https URL.
+    let url = typeof opts.resourceUrl === "function" ? opts.resourceUrl(ctx) || named : named;
+    if (typeof opts.resourceUrl === "string" && !/^https:\/\//i.test(url)) url = opts.resourceUrl;
+    if (!/^https:\/\//i.test(url)) {
+      if (opts.onUnchecked === "allow") return remember(req, null);
+      return refuse("unchecked", `no https URL of the paid service to check (${url || "none"}); pass resourceUrl (e.g. your MCP server's URL) or onUnchecked: "allow"`, { url });
+    }
+    const host = new URL(url).hostname.toLowerCase();
+    if (hostMatches(host, opts.denyHosts)) return refuse("denied_host", `${host} is on your deny list`, { url });
+    if (opts.allowHosts && !hostMatches(host, opts.allowHosts)) return refuse("not_allowed_host", `${host} is not on your allow list`, { url });
+    const before = budgetLeft(opts, spentToday, host);
+    if (before.over) return refuse("over_budget", before.over.replace(/^x402-guard: /, ""), { url });
+
+    let verdict;
+    try {
+      verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd);
+    } catch (e) {
+      if (opts.failOpen) return remember(req, null);
+      return refuse("alalanet_unreachable", `could not get a decision (${e.message}); not paying`, { url });
+    }
+    if (opts.onDecision) opts.onDecision({ url, ...verdict });
+
+    const okDecision = (o) => o.decision === "allow" || (o.decision === "hold" && onHold === "allow");
+    const options = verdict.options || [];
+    const chosen = verdictFor(req, options);
+    if (!chosen || !okDecision(chosen)) {
+      const reasons = chosen?.reasons?.length ? chosen.reasons : [...new Set(options.flatMap((o) => o.reasons || []))];
+      const decision = chosen?.decision || verdict.decision || "block";
+      const others = options.filter((o) => o !== chosen && okDecision(o));
+      const instead = others.length ? `; allowed instead: ${others.map((o) => `${o.pay_to} ${o.amount} on ${o.network}`).join(", ")}` : "";
+      return refuse(decision === "hold" ? "held" : "blocked", `alalanet says ${decision} (${reasons.join(", ") || "no reason"}); not paying ${url}${instead}`, {
+        url, decision, reasons, verdict,
+      });
+    }
+    // The budget again, now, with no await before the entry is recorded: other payments may have
+    // been approved while alalanet answered. alalanet blocks options above max_usd; this is checked
+    // here too, and a price alalanet could not put in dollars is refused when a budget is set.
+    const now = budgetLeft(opts, spentToday, host);
+    if (now.over) return refuse("over_budget", now.over.replace(/^x402-guard: /, ""), { url, verdict });
+    if (now.maxUsd !== undefined) {
+      if (chosen.usd === undefined || chosen.usd === null) {
+        return refuse("over_budget", `the price is unknown in US dollars (${chosen.amount} of ${chosen.asset}) and you set a budget; not paying ${url}`, { url, verdict });
+      }
+      if (chosen.usd > now.maxUsd + 1e-9) {
+        return refuse("over_budget", `${chosen.usd} USD is over what is left of your budget (${now.maxUsd}); not paying ${url}`, { url, verdict });
+      }
+    }
+    const entry = { at: Date.now(), usd: chosen.usd || 0, host };
+    spent.push(entry);
+    remember(req, entry);
+  }
+
+  // The payment was not created (the signer or a scheme failed): nothing was signed or sent, so its
+  // share of the budget is free again. Then the guard stops: failure hooks that run after it may hand
+  // back a replacement payment for ANOTHER option (@x402/svm's batch scheme does), which would go out
+  // without being checked. Throwing ends the client's hook loop with no payment.
+  async function onPaymentCreationFailure(ctx) {
+    const entries = byOption.get(ctx.selectedRequirements);
+    const entry = entries?.pop();
+    const i = entry ? spent.indexOf(entry) : -1;
+    if (i >= 0) spent.splice(i, 1);
+    const why = ctx.error?.message || String(ctx.error);
+    throw Object.assign(new Error(`${why} (x402-guard: no replacement payment is made, it would not be checked)`), { cause: ctx.error });
+  }
+
+  return { onBeforePaymentCreation, onPaymentCreationFailure };
+}
+
+/**
+ * Plug alalanet into the official x402 client (@x402/core): every payment it is about to create is
+ * judged first, within your budget. Works for @x402/fetch, @x402/axios and @x402/mcp.
+ *   const client = new x402Client();
+ *   registerExactEvmScheme(client, { signer });
+ *   alalanetGuard(client, { maxUsdPerCall: 0.05, maxUsdPerDay: 2 });
+ * @template C
+ * @param {C} client an x402Client
+ * @param {import('./index').GuardOptions & import('./index').HookOptions} [opts]
+ * @returns {C}
+ */
+export function alalanetGuard(client, opts = {}) {
+  const h = alalanetHooks(opts);
+  client.onBeforePaymentCreation(h.onBeforePaymentCreation);
+  client.onPaymentCreationFailure(h.onPaymentCreationFailure);
+  return client;
 }
