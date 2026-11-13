@@ -1,0 +1,46 @@
+# Publishes @alalanet/x402-guard to npm from a GitHub release through npm's trusted publishing (OIDC): no npm token
+# exists anywhere, and npm records provenance that ties each version to this workflow run and its commit. The
+# package's settings on npm trust exactly this file (alalanet/x402-guard, publish.yml) and allow publishing only.
+# A manual run (workflow_dispatch) does everything up to a dry-run publish, so the steps can be checked without a
+# release.
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # the OIDC token npm exchanges for a one-time publish credential
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: npm can publish through OIDC (trusted publishing needs npm 11.5.1 or later)
+        run: |
+          v=$(npm --version)
+          echo "npm $v"
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$v"
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: a release's tag names the package's version
+        if: github.event_name == 'release'
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - name: publish (a manual run only rehearses it)
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            npm publish --provenance --access public
+          else
+            npm publish --dry-run --provenance --access public
+          fi
