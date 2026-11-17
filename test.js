@@ -918,3 +918,17 @@ test("an approval put back after a definite refusal still lapses at the decision
   t.mock.timers.tick(61_000);
   await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig2" } }), (e) => e.code === "not_approved");
 });
+
+test("R5-F a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
+  for (const failOpen of [true, false]) {
+    let n = 0;
+    const api = async (url, init) => {
+      if (++n === 2) throw new Error("ECONNREFUSED");
+      const pr = unb64(JSON.parse(init.body).payment_required);
+      const options = pr.accepts.map((a) => ({ network: "base", asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: 0.002, decision: "block", reasons: ["pay_to_sanctioned"] }));
+      return new Response(JSON.stringify({ decision: "block", options, expires_at: new Date(Date.now() - 1000).toISOString() }), { status: 200 });
+    };
+    await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: api, failOpen })(URL1), (e) => e.code === "decision_expired", `failOpen ${failOpen}`);
+    assert.equal(n, 2);
+  }
+});
