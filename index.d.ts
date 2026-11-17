@@ -34,6 +34,7 @@ export interface Decision {
   decision: "allow" | "hold" | "block";
   options: PreflightOption[];
   choose?: PreflightOption;
+  /** the decision is never paid on after this (read on alalanet's clock via the answer's Date header) */
   expires_at: string;
   attestation?: unknown;
   service?: Record<string, unknown>;
@@ -189,7 +190,7 @@ export declare class X402GuardError extends Error {
   code:
     | "blocked" | "held" | "denied_host" | "not_allowed_host" | "not_allowed_url" | "over_budget" | "alalanet_unreachable"
     | "bad_402" | "already_paid" | "payment_outcome_unknown" | "pay_to_unexpected" | "pay_to_lookalike" | "not_delivered_before"
-    | "not_approved";
+    | "not_approved" | "decision_expired";
   /** already_paid: the settlement transaction of the earlier payment */
   tx?: string;
   status?: PaymentStatus;
@@ -215,7 +216,8 @@ export interface HookOptions {
   onAbort?(a: {
     code:
       | "blocked" | "held" | "unchecked" | "denied_host" | "not_allowed_host" | "not_allowed_url" | "over_budget"
-      | "alalanet_unreachable" | "cheaper_option" | "already_paid" | "pay_to_changed" | "pay_to_unexpected" | "pay_to_lookalike";
+      | "alalanet_unreachable" | "cheaper_option" | "already_paid" | "pay_to_changed" | "pay_to_unexpected" | "pay_to_lookalike"
+      | "decision_expired";
     message: string;
     url: string;
     decision?: string;
