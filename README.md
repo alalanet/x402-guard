@@ -35,7 +35,8 @@ A refused payment is never signed: the error message contains
 `Payment creation aborted: x402-guard <code>: <why>` (`@x402/fetch` puts
 `Failed to create payment payload:` in front), with `code` one of `blocked`, `held`, `over_budget`,
 `unchecked`, `denied_host`, `not_allowed_host`, `not_allowed_url`, `alalanet_unreachable`,
-`cheaper_option`, `already_paid`, `pay_to_changed`, `pay_to_unexpected` or `pay_to_lookalike`.
+`cheaper_option`, `already_paid`, `pay_to_changed`, `pay_to_unexpected`, `pay_to_lookalike` or
+`decision_expired`.
 
 The hook judges the option your client chose; if alalanet allows another one, the reason names it.
 `alalanetGuard` also registers a client policy that keeps, of the options to one payee on one network
@@ -145,7 +146,9 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
    `failOpen` pass. After a definite refusal the approval goes back first in line, holding no share
    of the budgets, so a payment your client signs again then (a recovery) is sent if the budgets have
    room for it, and counted. Any other payment your client signs by itself without a new 402 is
-   refused.
+   refused. An approval also lapses at the decision's `expires_at` (read on alalanet's clock through
+   its `Date` header) when that comes first, and both modes ask alalanet once more for a decision
+   already past it, then refuse (`decision_expired`).
 6. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
 
 ## New sellers
@@ -303,7 +306,7 @@ another purchase on the same URL is new money and is refused. `onNotDelivered: "
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`, `not_allowed_url`,
 `over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid`, `payment_outcome_unknown`,
-`pay_to_unexpected`, `pay_to_lookalike`, `not_delivered_before` or `not_approved`. `reasons` lists
+`pay_to_unexpected`, `pay_to_lookalike`, `not_delivered_before`, `not_approved` or `decision_expired`. `reasons` lists
 alalanet's reasons.
 
 ## Known flaws in your payment library

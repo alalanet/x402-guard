@@ -12,7 +12,7 @@ export class X402GuardError extends Error {
     this.name = "X402GuardError";
     // blocked | held | denied_host | not_allowed_host | not_allowed_url | over_budget | alalanet_unreachable
     // | bad_402 | already_paid | payment_outcome_unknown | pay_to_unexpected | pay_to_lookalike | not_delivered_before
-    // | not_approved
+    // | not_approved | decision_expired
     this.code = code;
     Object.assign(this, details);
   }
@@ -217,6 +217,9 @@ function payeeOf(value) {
 }
 
 const VERSION = "2.0";
+const EXPIRES = Symbol("expires"); // a decision's expires_at on our clock (ms), Infinity if it has none
+// a decision past its expires_at: never paid on
+const expired = (verdict) => verdict[EXPIRES] <= Date.now();
 const MEMORY = 1000; // entries kept per guard: payees paid, resources paid, sellers that did not deliver
 const RESERVE_MS = 5 * 60 * 1000; // wrapper: how long an approved 402's share counts while it waits for its payment
 const APPROVAL_MS = RESERVE_MS + 15 * 60 * 1000; // wrapper: how long an approved 402 may still be paid
@@ -254,6 +257,10 @@ function makePreflight(opts, mode) {
     const res = await call(`${api}/v1/preflight`, { method: "POST", headers, body: JSON.stringify(body) });
     if (!res.ok) throw new Error(`alalanet preflight HTTP ${res.status}`);
     const verdict = await res.json();
+    // expires_at is on alalanet's clock: moved onto ours by the answer's Date header, when it has one
+    const until = Date.parse(verdict.expires_at);
+    const said = Date.parse(res.headers?.get?.("date"));
+    Object.defineProperty(verdict, EXPIRES, { value: Number.isFinite(until) ? until - (Number.isFinite(said) ? said - Date.now() : 0) : Infinity });
     if (verdict.client_advisories?.length && !warned) {
       warned = true;
       if (opts.onAdvisory) opts.onAdvisory(verdict.client_advisories);
@@ -386,7 +393,7 @@ function cheapestFirst(options) {
 export function guardFetch(inner, opts = {}) {
   const { api, call, ua, preflight } = makePreflight(opts, "fetch");
   const rules = makeRules(opts);
-  const pending = new Map(); // url -> [{at, entry, allowed}]: approved 402s waiting for their payment, oldest first
+  const pending = new Map(); // url -> [{lapse, entry, allowed}]: approved 402s waiting for their payment, oldest first
   const holds = new Map(); // purchase key -> held payment {header, value, info, until, settledTx?, entry?}
   const notDelivered = new Map(); // "host payee" -> {payTo, at}: took a payment there and did not deliver
   const SVM_WINDOW_MS = 60 * 1000; // a Solana blockhash is valid for about 60-90 s
@@ -475,13 +482,13 @@ export function guardFetch(inner, opts = {}) {
     return { request, held: holds.get(key), created: false };
   }
 
-  // The queue an approval for this URL joins. At most 100 per URL and MEMORY URLs wait (each up to
-  // APPROVAL_MS); past that the 402 is refused, never another URL's approval evicted: its payment
+  // The queue an approval for this URL joins. At most 100 per URL and MEMORY URLs wait (each until it
+  // lapses: APPROVAL_MS, or sooner at the decision's expiry); past that the 402 is refused, never another URL's approval evicted: its payment
   // would then be refused as not approved.
   function roomFor(url, verdict) {
     const now = Date.now();
     for (const [u, q] of pending) {
-      while (q.length && now - q[0].at > APPROVAL_MS) q.shift();
+      while (q.length && now > q[0].lapse) q.shift();
       if (!q.length) pending.delete(u);
     }
     const queue = pending.get(url) || [];
@@ -498,7 +505,7 @@ export function guardFetch(inner, opts = {}) {
   function takeReservation(url) {
     const queue = pending.get(url) || [];
     let r = queue.shift();
-    while (r && Date.now() - r.at > APPROVAL_MS) {
+    while (r && Date.now() > r.lapse) {
       if (r.entry) rules.drop(r.entry);
       r = queue.shift(); // lapsed: it approves nothing any more
     }
@@ -558,7 +565,7 @@ export function guardFetch(inner, opts = {}) {
     if (isPaid && !again && !reserved) {
       // new money for a 402 this guard did not judge, or whose approval lapsed: nothing was approved
       if (created) holds.delete(key);
-      throw new X402GuardError("not_approved", `x402-guard: no 402 of ${url} was approved for this payment in the last ${APPROVAL_MS / 60000} minutes; not sending it`, { url });
+      throw new X402GuardError("not_approved", `x402-guard: no 402 of ${url} was approved for this payment, or the approval lapsed (after ${APPROVAL_MS / 60000} minutes or at the decision's expiry); not sending it`, { url });
     }
     if (again && reserved) rules.drop(reserved.entry);
     if (created && reserved) held.entry = reserved.entry;
@@ -585,7 +592,7 @@ export function guardFetch(inner, opts = {}) {
         const e = reserved.entry;
         const queue = pending.get(url) || [];
         if (queue.length < 100 && (queue.length || pending.size < MEMORY)) {
-          queue.unshift({ at: reserved.at, entry: e && { at: Date.now(), usd: e.usd, host: e.host, fresh: e.fresh, until: 0 }, allowed: reserved.allowed });
+          queue.unshift({ lapse: reserved.lapse, entry: e && { at: Date.now(), usd: e.usd, host: e.host, fresh: e.fresh, until: 0 }, allowed: reserved.allowed });
           pending.set(url, queue);
         }
       }
@@ -623,14 +630,16 @@ export function guardFetch(inner, opts = {}) {
     let verdict;
     try {
       verdict = await preflight(url, header || text, budget.maxUsd);
+      if (expired(verdict)) verdict = await preflight(url, header || text, budget.maxUsd); // once more
     } catch (e) {
       if (opts.failOpen) {
-        roomFor(url).push({ at: Date.now(), entry: null, allowed: [] }); // a pass: not checked, not counted
+        roomFor(url).push({ lapse: Date.now() + APPROVAL_MS, entry: null, allowed: [] }); // a pass: not checked, not counted
         return new Response(text, { status: 402, headers: response.headers });
       }
       throw new X402GuardError("alalanet_unreachable", `x402-guard: could not get a decision (${e.message}); not paying`, { url });
     }
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
+    if (expired(verdict)) throw new X402GuardError("decision_expired", `x402-guard: alalanet's decision was past its expiry twice; not paying ${url}`, { url, verdict });
 
     // From here to the reservation nothing awaits: 402s judged meanwhile have reserved their share.
     const now = budgetLeft(opts, rules.spent, host);
@@ -674,7 +683,7 @@ export function guardFetch(inner, opts = {}) {
     const queue = roomFor(url, verdict);
     const at = Date.now();
     const entry = rules.add({ at, usd: Math.max(...allowed.map((o) => o.usd || 0)), host, fresh: allowed.some((o) => judged.get(o).fresh), until: at + RESERVE_MS });
-    queue.push({ at, entry, allowed });
+    queue.push({ lapse: Math.min(at + APPROVAL_MS, verdict[EXPIRES]), entry, allowed });
 
     // Hand the payer only the allowed options, in the order of `allowed` (cheapest first).
     const rank = (a) => allowed.findIndex((o) => optionMatches(a, [o]) && (o.network_id === undefined || same(o.network_id, a.network)));
@@ -815,11 +824,13 @@ export function alalanetHooks(opts = {}) {
     let verdict;
     try {
       verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd);
+      if (expired(verdict)) verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd); // once more
     } catch (e) {
       if (opts.failOpen) return remember(req, null);
       return refuse("alalanet_unreachable", `could not get a decision (${e.message}); not paying`, { url });
     }
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
+    if (expired(verdict)) return refuse("decision_expired", `alalanet's decision was past its expiry twice; not paying ${url}`, { url, verdict });
 
     // From here to the record nothing awaits: payments approved while alalanet answered are counted.
     const left = rules.newLeft();

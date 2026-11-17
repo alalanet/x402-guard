@@ -850,3 +850,71 @@ test("after a definite refusal of a re-presented payment, the unused approval of
   assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x03", vb) } })).status, 200, "a re-sign uses the approval put back");
   assert.deepEqual(s.paid.map((p) => unb64(p).payload.authorization.nonce), ["0x01", "0x01", "0x03"]);
 });
+
+// --- 2.0: the decision's own expiry (expires_at) -------------------------------------------------
+
+// alalanet stand-in whose decision expires `ttl` ms after its own clock, which runs `skew` ms behind ours
+function expiring({ ttl, skew = 0, stale = 0 }) {
+  const calls = [];
+  const f = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    const pr = unb64(body.payment_required);
+    const options = pr.accepts.map((a) => ({ network: "base", asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: Number(a.amount) / 1e6, decision: "allow" }));
+    const server = Date.now() - skew;
+    const expires = calls.length <= stale ? server - 1000 : server + ttl;
+    return new Response(JSON.stringify({ decision: "allow", options, expires_at: new Date(expires).toISOString() }), { status: 200, headers: { date: new Date(server).toUTCString() } });
+  };
+  return { f, calls };
+}
+
+test("an approval lapses at the decision's expires_at when that is sooner than 20 minutes", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = expiring({ ttl: 60_000 });
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f });
+  await g(URL1);
+  t.mock.timers.tick(59_000);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } })).status, 200);
+  await g(URL1);
+  t.mock.timers.tick(61_000);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } }), (e) => e.code === "not_approved");
+  assert.equal((await g(URL1)).status, 402, "a new 402 goes back to alalanet");
+  assert.equal(a.calls.length, 3);
+  const later = expiring({ ttl: 60 * 60 * 1000 });
+  const h = guardFetch(server({ accepts: [good] }).inner, { fetch: later.f });
+  await h(URL1);
+  t.mock.timers.tick(20 * 60 * 1000 + 1);
+  await assert.rejects(h(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } }), (e) => e.code === "not_approved", "the guard's own 20 minutes still bound it");
+});
+
+test("expires_at is read on alalanet's clock (its Date header), not ours", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = expiring({ ttl: 60_000, skew: 10 * 60 * 1000 }); // alalanet's clock 10 minutes behind
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f });
+  await g(URL1);
+  t.mock.timers.tick(30_000);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } })).status, 200);
+});
+
+test("a decision already past its expiry is asked again once, then refused decision_expired", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const once = expiring({ ttl: 60_000, stale: 1 });
+  assert.equal((await guardFetch(server({ accepts: [good] }).inner, { fetch: once.f })(URL1)).status, 402);
+  assert.equal(once.calls.length, 2);
+  const twice = expiring({ ttl: 60_000, stale: 2 });
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: twice.f })(URL1), (e) => e.code === "decision_expired");
+  assert.equal(twice.calls.length, 2);
+});
+
+test("an approval put back after a definite refusal still lapses at the decision's expiry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const inner = async (req) =>
+    req.headers.has("PAYMENT-SIGNATURE")
+      ? new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) } })
+      : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+  const g = guardFetch(inner, { fetch: expiring({ ttl: 60_000 }).f });
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
+  t.mock.timers.tick(61_000);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig2" } }), (e) => e.code === "not_approved");
+});

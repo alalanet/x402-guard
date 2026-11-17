@@ -733,3 +733,28 @@ test("R2-E the expectPayTo exception pays only the pinned payee; a resourceUrl s
   const str = makeClient({ allowHosts: ["api.trusted.example"], resourceUrl: "https://api.trusted.example/" }, NEWHOLD);
   await assert.rejects(str.client.createPaymentPayload(required([{ ...good, payTo: "0xEVIL" }], "https://api.trusted.example/x")), /held/);
 });
+
+test("hook: a decision already past its expiry is asked again once, then refused decision_expired", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const make = (stale) => {
+    const calls = [];
+    const fetch = async (url, init) => {
+      calls.push(1);
+      const pr = JSON.parse(JSON.parse(init.body).payment_required);
+      const options = pr.accepts.map((a) => ({ network: "base", network_id: a.network, asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: 0.002, decision: "allow" }));
+      const expires = calls.length <= stale ? Date.now() - 1000 : Date.now() + 60_000;
+      return new Response(JSON.stringify({ decision: "allow", options, expires_at: new Date(expires).toISOString() }), { status: 200, headers: { date: new Date().toUTCString() } });
+    };
+    const signed = [];
+    const client = new x402Client();
+    client.register("eip155:8453", { scheme: "exact", findDefaultAsset: () => ({ asset: USDC, decimals: 6, symbol: "USDC" }), async createPaymentPayload(v, req) { signed.push(req.payTo); return { x402Version: v, payload: {} }; } });
+    alalanetGuard(client, { fetch, detectClient: false });
+    return { client, signed, calls };
+  };
+  const once = make(1);
+  await once.client.createPaymentPayload(required([good]));
+  assert.deepEqual([once.signed.length, once.calls.length], [1, 2]);
+  const twice = make(2);
+  await assert.rejects(twice.client.createPaymentPayload(required([good])), /x402-guard decision_expired/);
+  assert.deepEqual([twice.signed.length, twice.calls.length], [0, 2]);
+});
