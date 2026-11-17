@@ -932,3 +932,11 @@ test("R5-F a decision expired on arrival whose re-ask fails is refused decision_
     assert.equal(n, 2);
   }
 });
+
+test("listing_removed (the catalogue no longer lists the service) is never paid as new", async () => {
+  const a = alalanet(() => ({ decision: "hold", reasons: ["listing_removed", "testnet"] }));
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: a.f })(URL1), (e) => e.code === "held" && e.reasons.includes("listing_removed"));
+  const withNew = alalanet(() => ({ decision: "hold", reasons: ["not_checked_yet", "listing_removed"] }));
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: withNew.f })(URL1), (e) => e.code === "held");
+  assert.equal((await guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, onHold: "allow" })(URL1)).status, 402);
+});

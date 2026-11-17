@@ -121,10 +121,11 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 2. alalanet judges each payment option:
    - **block**: the payTo is unknown, on the OFAC list or frozen by the stablecoin issuer, the service
      is not working, the quote in the 402 has expired (`quote_expired`), or the price is over your budget;
-   - **hold**: the payTo differs from the listing or was never seen, the price is above the listing or
-     what alalanet observed, the network or asset is not listed, the price is $5 or more, the trust
-     score is low, or the service is unknown or not checked yet. What the guard does with a hold is
-     `onHold`, see [New sellers](#new-sellers);
+   - **hold**: the payTo differs from the listing or was never seen, the catalogue no longer lists the
+     service (`listing_removed`), the price is above the listing or what alalanet observed, the
+     network or asset is not listed, the price is $5 or more, the trust score is low, or the service
+     is unknown or not checked yet. What the guard does with a hold is `onHold`, see
+     [New sellers](#new-sellers);
    - **allow**: otherwise.
 
    The decision is signed and written to a public log. It records the endpoint, the terms and the
@@ -160,7 +161,7 @@ reasons such as `testnet`) is paid, up to **$0.05 a payment and $0.25 a rolling 
 payments together (`newSeller: { maxUsdPerCall, maxUsdPerDay }`). The caps are kept in memory per
 guard object: a new process, or a guard made per task, starts again at $0.25. Make one guard per
 agent and keep it. A hold that compares the payment against data (`price_above_listing`,
-`pay_to_differs_from_listing`, `asset_not_stablecoin`, `network_not_listed`, `high_price`,
+`pay_to_differs_from_listing`, `listing_removed`, `asset_not_stablecoin`, `network_not_listed`, `high_price`,
 `low_trust_score`, ...) or a reason the guard does not know is
 still refused, and a block (`quote_expired`, `over_budget`, ...) is never paid. In the hook, a new
 seller is not paid while `allowHosts` or `allowUrlPrefixes` is set and the 402 names the URL (see

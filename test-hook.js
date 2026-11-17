@@ -776,3 +776,9 @@ test("R5-F hook: a decision expired on arrival whose re-ask fails is refused dec
     assert.deepEqual([signed.length, n], [0, 2]);
   }
 });
+
+test("hook: listing_removed is never paid as new", async () => {
+  const { client, signed } = makeClient({}, () => ({ decision: "hold", reasons: ["unknown_service", "listing_removed"] }));
+  await assert.rejects(client.createPaymentPayload(required([good])), /x402-guard held: .*listing_removed/);
+  assert.deepEqual(signed, []);
+});
