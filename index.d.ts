@@ -101,7 +101,8 @@ export interface GuardOptions {
    * applied to every URL that starts with it): one address or several. Any other payTo for a matching
    * URL is refused (pay_to_unexpected). Look-alikes (same first and last four characters, another
    * address) of these and of payees this guard paid on the same host are refused (pay_to_lookalike);
-   * an option alalanet allows is not compared with the paid ones.
+   * an option alalanet allows is not compared with the paid ones. The hook learns a payee only from a
+   * payment alalanet allowed (there the host is the one the 402 names).
    */
   expectPayTo?: Record<string, string | string[]>;
   /**
@@ -138,9 +139,9 @@ export interface GuardOptions {
    * Double-pay protection (default true). Wrapper: hold the signed payment per purchase (method + URL +
    * body) and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read
    * on chain) before a new payment may be signed. Hook: per resource (the URL the 402 names, e.g.
-   * mcp://tool/<name>), refuse a second payment while the first is open (already_paid) and one to
-   * another payee for 15 minutes unless alalanet allows that payee (pay_to_changed); a settled payment
-   * or a definite refusal ends that.
+   * mcp://tool/<name>), refuse a second payment, to any payee, while the first is open (already_paid),
+   * and after that one to another payee until 15 minutes after the first unless alalanet allows that
+   * payee (pay_to_changed); a settled payment or a definite refusal ends that.
    * Set false to disable.
    */
   holdPayments?: boolean;
@@ -186,7 +187,8 @@ export declare function solanaPaymentInfo(txBase64: string): { signers: string[]
 export declare class X402GuardError extends Error {
   code:
     | "blocked" | "held" | "denied_host" | "not_allowed_host" | "not_allowed_url" | "over_budget" | "alalanet_unreachable"
-    | "bad_402" | "already_paid" | "payment_outcome_unknown" | "pay_to_unexpected" | "pay_to_lookalike" | "not_delivered_before";
+    | "bad_402" | "already_paid" | "payment_outcome_unknown" | "pay_to_unexpected" | "pay_to_lookalike" | "not_delivered_before"
+    | "not_approved";
   /** already_paid: the settlement transaction of the earlier payment */
   tx?: string;
   status?: PaymentStatus;

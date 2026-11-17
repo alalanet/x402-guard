@@ -45,9 +45,9 @@ on the same network and scheme, the hook refuses it with `cheaper_option` and na
 
 One open payment per resource: after the hook lets a payment through, a second one for the same
 resource (the URL the 402 names; for a paid MCP tool, `mcp://tool/<name>`) is refused while the
-first is open, until its `validBefore` or else the 402's `maxTimeoutSeconds` (`already_paid`), and
-one to another payee is refused for 15 minutes (`pay_to_changed`) unless alalanet allows that payee
-(it matches the listing). A seller that takes the money and then asks again for the same resource,
+first is open, until its `validBefore` or else the 402's `maxTimeoutSeconds` (`already_paid`), to
+any payee. After that, one to another payee is refused until 15 minutes after the first payment
+(`pay_to_changed`) unless alalanet allows that payee (it matches the listing). A seller that takes the money and then asks again for the same resource,
 asks for a new payout address, or answers "this quote expired, pay the new one" gets one payment. A
 seller that names another resource each time (`?n=1`, `?n=2`, ...) is paid each time, within your
 budgets. A seller can also name the resource of another seller alalanet does not list; that seller's
@@ -135,11 +135,16 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 4. The budgets count the dearest option handed over from that moment, so 402s answered in parallel
    cannot all fit one budget. The share is freed when the payment is refused for sure (a facilitator
    code and no transaction), when a retry re-sends the held payment instead of a new one, or after 5
-   minutes if no payment came. A payment that comes later than that is checked against the budgets
-   again and not sent if they have no room (`over_budget`). A paid call that fails in any other way
-   stays counted: it may have settled. At most 100 402s per URL, and 1,000 URLs, wait for their
-   payment (for up to a day); past that the guard refuses the 402 (`over_budget`).
-5. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
+   minutes if no payment came. A payment that comes later than that, up to 20 minutes after its 402,
+   is checked against the budgets again and not sent if they have no room (`over_budget`). A paid
+   call that fails in any other way stays counted: it may have settled. At most 100 402s per URL, and
+   1,000 URLs, wait for their payment; past that the guard refuses the 402 (`over_budget`) until
+   some are paid or 20 minutes old.
+5. A payment with no 402 approved for its URL in the last 20 minutes is refused before it is sent
+   (`not_approved`). Two exceptions: a retry that re-sends a held payment, and a payment after a
+   `failOpen` pass. A payment your client signs again by itself without a new 402 (for example after
+   a payment-response hook of your own reports a recovery) is therefore refused.
+6. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
 
 ## New sellers
 
@@ -190,15 +195,22 @@ from 1.x:
 - **New sellers are paid** up to $0.05 a payment and $0.25 a day (`onHold: "new"`, the new default).
   `onHold: "block"` gives back 1.x's behaviour.
 - **Payments 1.x made that 2.0 refuses**, with the way back:
-  - hook: a second payment for a resource while the first is open (`already_paid`), another payee
-    for a resource just paid (`pay_to_changed`): `holdPayments: false`;
+  - hook: a second payment for a resource while the first is open, to any payee (`already_paid`),
+    another payee for a resource just paid (`pay_to_changed`): `holdPayments: false`;
+  - hook: a new seller while `allowHosts` or `allowUrlPrefixes` is set and the 402 names the URL
+    (`held`): pin the payee with `expectPayTo`, or choose the URL with a `resourceUrl` function;
   - hook: a payee's dearer option when the guard would pay a cheaper one (`cheaper_option`); the
     client policy `alalanetGuard` registers drops such options before the client chooses;
   - wrapper: a payee that took a payment on that host and did not deliver (`not_delivered_before`):
     `onNotDelivered: "allow"`;
   - both: a look-alike of a payee paid on that host or expected (`pay_to_lookalike`);
   - wrapper: a payee's dearer options are no longer handed to the payer, and the allowed options
-    come cheapest first.
+    come cheapest first;
+  - wrapper: a payment that comes more than 5 minutes after its 402 when the budgets have no room
+    for it any more, and a 402 while 100 for its URL (or 1,000 URLs) wait for payment (`over_budget`):
+    raise the budgets, or pay sooner;
+  - wrapper: a payment with no 402 approved for its URL in the last 20 minutes (`not_approved`): let
+    the payment go through the guard's 402 first.
 - **Budgets in the wrapper** count a payment from the moment its 402 goes to the payer, and keep a
   paid call that failed without a definite refusal counted (1.x freed it).
 - The User-Agent sent to alalanet is `x402-guard/2.0 (hook|fetch)`.
@@ -254,6 +266,9 @@ another purchase on the same URL is new money and is refused. `onNotDelivered: "
   `expectPayTo`, or as a payee this guard paid on the same host, but another address, is refused
   (`pay_to_lookalike`). An option alalanet allows is not refused for looking like a payee paid
   before: its listing vouches for it, and a look-alike paid once cannot lock the honest payee out.
+  In the hook the host is the one the 402 names, so the hook learns a payee only from a payment
+  alalanet allowed; a look-alike paid as a new seller is not learned. Pins in `expectPayTo` are the
+  only defence for a host alalanet does not list.
 
 ## Options
 
@@ -286,7 +301,8 @@ another purchase on the same URL is new money and is refused. `onNotDelivered: "
 
 `X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`, `not_allowed_url`,
 `over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid`, `payment_outcome_unknown`,
-`pay_to_unexpected`, `pay_to_lookalike` or `not_delivered_before`. `reasons` lists alalanet's reasons.
+`pay_to_unexpected`, `pay_to_lookalike`, `not_delivered_before` or `not_approved`. `reasons` lists
+alalanet's reasons.
 
 ## Known flaws in your payment library
 

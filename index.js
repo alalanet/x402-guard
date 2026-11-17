@@ -12,6 +12,7 @@ export class X402GuardError extends Error {
     this.name = "X402GuardError";
     // blocked | held | denied_host | not_allowed_host | not_allowed_url | over_budget | alalanet_unreachable
     // | bad_402 | already_paid | payment_outcome_unknown | pay_to_unexpected | pay_to_lookalike | not_delivered_before
+    // | not_approved
     this.code = code;
     Object.assign(this, details);
   }
@@ -217,7 +218,8 @@ function payeeOf(value) {
 
 const VERSION = "2.0";
 const MEMORY = 1000; // entries kept per guard: payees paid, resources paid, sellers that did not deliver
-const RESERVE_MS = 5 * 60 * 1000; // wrapper: how long an approved 402 waits for its payment
+const RESERVE_MS = 5 * 60 * 1000; // wrapper: how long an approved 402's share counts while it waits for its payment
+const APPROVAL_MS = RESERVE_MS + 15 * 60 * 1000; // wrapper: how long an approved 402 may still be paid
 const PAY_TO_CHANGED_MS = 15 * 60 * 1000; // hook: how long a resource just paid may not ask for another payee
 
 // alalanet's hold reasons that only say it has no data on the seller yet. Every other hold reason
@@ -479,9 +481,13 @@ export function guardFetch(inner, opts = {}) {
   // counting, so the budgets must have room for it again, or nothing is sent.
   function takeReservation(url) {
     const queue = pending.get(url) || [];
-    const r = queue.shift();
+    let r = queue.shift();
+    while (r && Date.now() - r.at > APPROVAL_MS) {
+      if (r.entry) rules.drop(r.entry);
+      r = queue.shift(); // lapsed: it approves nothing any more
+    }
     if (!queue.length) pending.delete(url);
-    if (!r) return r;
+    if (!r?.entry) return r; // none, or a failOpen pass (not checked, not counted)
     const { usd, host, fresh, until } = r.entry;
     rules.drop(r.entry);
     if (until <= Date.now()) {
@@ -517,8 +523,8 @@ export function guardFetch(inner, opts = {}) {
     let request = new Request(input, init);
     const url = request.url;
     const isPaid = PAID_HEADERS.some((h) => request.headers.has(h));
-    // to tell a retry of a held purchase from a new one if a payee here did not deliver
-    const probe = !isPaid && notDelivered.size && request.body ? request.clone() : request;
+    // to tell a retry of a held purchase from a new one, should a payee here turn out not to deliver
+    const probe = !isPaid && request.body ? request.clone() : request;
     let key, held, created, reserved;
     if (isPaid) {
       reserved = takeReservation(url);
@@ -533,6 +539,11 @@ export function guardFetch(inner, opts = {}) {
       }
     }
     const again = Boolean(held && !created); // the held payment goes out again: no new money
+    if (isPaid && !again && !reserved) {
+      // new money for a 402 this guard did not judge, or whose approval lapsed: nothing was approved
+      if (created) holds.delete(key);
+      throw new X402GuardError("not_approved", `x402-guard: no 402 of ${url} was approved for this payment in the last ${APPROVAL_MS / 60000} minutes; not sending it`, { url });
+    }
     if (again && reserved) rules.drop(reserved.entry);
     if (created && reserved) held.entry = reserved.entry;
     const sent = again ? held.entry : reserved?.entry; // the budget entry of the payment going out
@@ -587,7 +598,10 @@ export function guardFetch(inner, opts = {}) {
     try {
       verdict = await preflight(url, header || text, budget.maxUsd);
     } catch (e) {
-      if (opts.failOpen) return new Response(text, { status: 402, headers: response.headers });
+      if (opts.failOpen) {
+        bounded(pending, url, pending.get(url) || []).push({ at: Date.now(), entry: null, allowed: [] });
+        return new Response(text, { status: 402, headers: response.headers });
+      }
       throw new X402GuardError("alalanet_unreachable", `x402-guard: could not get a decision (${e.message}); not paying`, { url });
     }
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
@@ -628,12 +642,12 @@ export function guardFetch(inner, opts = {}) {
         url, decision: verdict.decision, reasons, verdict,
       });
     }
-    // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes). A
-    // reservation waits up to a day for its payment; at most 100 per URL and MEMORY URLs wait, and
-    // past that the 402 is refused: a dropped one would leave its payment uncounted.
+    // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes). An
+    // approval waits APPROVAL_MS for its payment; at most 100 per URL and MEMORY URLs wait, and past
+    // that the 402 is refused: a dropped one would leave its payment unapproved.
     const at = Date.now();
     for (const [u, q] of pending) {
-      while (q.length && at - q[0].at > DAY_MS) q.shift();
+      while (q.length && at - q[0].at > APPROVAL_MS) q.shift();
       if (!q.length) pending.delete(u);
     }
     const queue = pending.get(url) || [];
@@ -737,14 +751,16 @@ export function alalanetHooks(opts = {}) {
     return { abort: true, reason: `x402-guard ${code}: ${message}` };
   };
 
-  // [code, why] when a payment for this resource is still open, or it was just paid to another payee
-  // that alalanet does not vouch for (allow: it matches the listing).
+  // [code, why] when a payment for this resource is still open (any payee), or it was just paid to
+  // another payee that alalanet does not vouch for (allow: it matches the listing). vouched undefined:
+  // the verdict is not known yet, so only the same payee is refused.
   function repeat(url, payTo, vouched) {
     const m = paidFor.get(url);
     const now = Date.now();
     if (!m || now >= m.keep) return null;
-    if (!samePayee(m.payTo, payTo)) return vouched ? null : ["pay_to_changed", `${url} was just paid to ${m.payTo} and now asks for ${payTo}; not paying the new address`];
-    if (now < m.until) return ["already_paid", `a payment for ${url} went out ${Math.round((now - m.at) / 1000)} s ago and is still open; not paying again`];
+    const other = !samePayee(m.payTo, payTo);
+    if (other && vouched === false) return ["pay_to_changed", `${url} was just paid to ${m.payTo} and now asks for ${payTo}; not paying the new address`];
+    if (now < m.until && (!other || vouched)) return ["already_paid", `a payment for ${url} went out ${Math.round((now - m.at) / 1000)} s ago and is still open; not paying again`];
     return null;
   }
 
@@ -775,7 +791,7 @@ export function alalanetHooks(opts = {}) {
     const before = budgetLeft(opts, rules.spent, host);
     if (before.over) return refuse("over_budget", before.over.replace(/^x402-guard: /, ""), { url });
     const resource = named || url;
-    const open = repeat(resource, req.payTo, true); // another payee waits for alalanet's verdict
+    const open = repeat(resource, req.payTo); // another payee waits for alalanet's verdict
     if (open) return refuse(open[0], open[1], { url });
 
     let verdict;
@@ -835,7 +851,7 @@ export function alalanetHooks(opts = {}) {
     const still = repeat(resource, req.payTo, vouched);
     if (still) return refuse(still[0], still[1], { url, verdict });
     const at = Date.now();
-    const entry = rules.add({ at, usd: chosen.usd || 0, host, fresh: Boolean(judgment.fresh) });
+    const entry = rules.add({ at, usd: chosen.usd || 0, host, fresh: Boolean(judgment.fresh), vouched });
     if (opts.holdPayments !== false) {
       const until = at + (Number(req.maxTimeoutSeconds) || 60) * 1000;
       entry.mark = bounded(paidFor, resource, { url: resource, payTo: req.payTo, at, until, keep: Math.max(until, at + PAY_TO_CHANGED_MS) });
@@ -847,7 +863,8 @@ export function alalanetHooks(opts = {}) {
   // validBefore, when it has one, says how long it stays open.
   async function onAfterPaymentCreation(ctx) {
     const e = (byOption.get(ctx.selectedRequirements) || []).at(-1);
-    if (e) rules.rememberPayee(e.host, ctx.selectedRequirements.payTo);
+    // the host is the one the 402 names: only a payee alalanet allowed (its listing) is learned
+    if (e?.vouched) rules.rememberPayee(e.host, ctx.selectedRequirements.payTo);
     const vb = Number(ctx.paymentPayload?.payload?.authorization?.validBefore);
     if (current(e) && vb > 0) {
       e.mark.until = vb * 1000;
