@@ -138,12 +138,15 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
    minutes if no payment came. A payment that comes later than that, up to 20 minutes after its 402,
    is checked against the budgets again and not sent if they have no room (`over_budget`). A paid
    call that fails in any other way stays counted: it may have settled. At most 100 402s per URL, and
-   1,000 URLs, wait for their payment; past that the guard refuses the 402 (`over_budget`) until
-   some are paid or 20 minutes old.
+   1,000 URLs, wait for their payment; past that the guard refuses the 402 (`over_budget`), a
+   `failOpen` pass included, until some are paid or 20 minutes old. It never drops another URL's
+   approval to make room.
 5. A payment with no 402 approved for its URL in the last 20 minutes is refused before it is sent
-   (`not_approved`). Two exceptions: a retry that re-sends a held payment, and a payment after a
-   `failOpen` pass. A payment your client signs again by itself without a new 402 (for example after
-   a payment-response hook of your own reports a recovery) is therefore refused.
+   (`not_approved`). Exceptions: a retry that re-sends a held payment, and a payment after a
+   `failOpen` pass. After a definite refusal the approval goes back first in line, holding no share
+   of the budgets, so a payment your client signs again then (a recovery) is sent if the budgets have
+   room for it, and counted. Any other payment your client signs by itself without a new 402 is
+   refused.
 6. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
 
 ## New sellers

@@ -118,7 +118,8 @@ export interface GuardOptions {
   /**
    * if alalanet cannot be reached: refuse to pay (false, default) or let the payment go ahead unchecked
    * (true: the wrapper passes the 402 through, the hook does not abort); such a payment is not counted
-   * against the hook's budgets
+   * against the budgets. The wrapper still refuses the 402 (over_budget) while 100 for its URL or 1,000
+   * URLs wait for their payment.
    */
   failOpen?: boolean;
   /** fetch used to call alalanet (default: globalThis.fetch) */
