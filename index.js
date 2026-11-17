@@ -169,11 +169,13 @@ function hostMatches(host, patterns) {
   });
 }
 
-// A URL prefix matches on the same origin, by the start of the path (and query).
+// A URL prefix matches on the same origin, by the start of the path (and query). A path with an
+// encoded slash, backslash or dot could be decoded by the server into another path: never a match.
 function prefixMatches(url, prefix) {
   try {
     const u = new URL(url);
     const p = new URL(prefix);
+    if (/%2f|%5c|%2e/i.test(u.pathname)) return false;
     return u.origin === p.origin && (u.pathname + u.search).startsWith(p.pathname + p.search);
   } catch {
     return false;
@@ -285,9 +287,8 @@ function makeRules(opts) {
   function spent(host, fresh) {
     const now = Date.now();
     while (entries.length && now - entries[0].at > DAY_MS) entries.shift();
-    return entries
-      .filter((e) => (e.until === undefined || e.until > now) && (host === undefined || e.host === host) && (!fresh || e.fresh))
-      .reduce((s, e) => s + e.usd, 0);
+    for (let i = entries.length - 1; i >= 0; i--) if (entries[i].until <= now) entries.splice(i, 1); // unused reservations
+    return entries.filter((e) => (host === undefined || e.host === host) && (!fresh || e.fresh)).reduce((s, e) => s + e.usd, 0);
   }
   const add = (e) => (entries.push(e), e);
   const drop = (e) => {
@@ -606,7 +607,8 @@ export function guardFetch(inner, opts = {}) {
     // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes).
     const at = Date.now();
     const entry = rules.add({ at, usd: Math.max(...allowed.map((o) => o.usd || 0)), host, fresh: allowed.some((o) => judged.get(o).fresh), until: at + RESERVE_MS });
-    bounded(pending, url, pending.get(url) || []).push({ entry, allowed });
+    const queue = bounded(pending, url, pending.get(url) || []);
+    if (queue.push({ entry, allowed }) > 100) queue.shift();
 
     // Hand the payer only the allowed options, in the order of `allowed` (cheapest first).
     const rank = (a) => allowed.findIndex((o) => optionMatches(a, [o]) && (o.network_id === undefined || same(o.network_id, a.network)));
@@ -690,9 +692,9 @@ export function alalanetHooks(opts = {}) {
     if (!byOption.has(req)) byOption.set(req, []);
     byOption.get(req).push(entry);
   };
-  // The payment approved per resource URL, {url, payTo, at, until, keep}: until its validBefore no
-  // second payment for the resource, until keep none to another payee. A settled payment or a
-  // definite refusal ends it.
+  // The payment approved per resource (the 402's own resource URL, e.g. mcp://tool/<name>, else the
+  // URL checked), {url, payTo, at, until, keep}: until its validBefore no second payment for the
+  // resource, until keep none to another payee. A settled payment or a definite refusal ends it.
   const paidFor = new Map();
   const current = (e) => Boolean(e?.mark) && paidFor.get(e.mark.url) === e.mark;
 
@@ -737,7 +739,8 @@ export function alalanetHooks(opts = {}) {
     if (payee) return refuse(payee[0], `${payee[1]}; not paying ${url}`, { url });
     const before = budgetLeft(opts, rules.spent, host);
     if (before.over) return refuse("over_budget", before.over.replace(/^x402-guard: /, ""), { url });
-    const open = repeat(url, req.payTo);
+    const resource = named || url;
+    const open = repeat(resource, req.payTo);
     if (open) return refuse(open[0], open[1], { url });
 
     let verdict;
@@ -788,13 +791,13 @@ export function alalanetHooks(opts = {}) {
         return refuse("over_budget", `${chosen.usd} USD is over what is left of your budget (${now.maxUsd}); not paying ${url}`, { url, verdict });
       }
     }
-    const still = repeat(url, req.payTo);
+    const still = repeat(resource, req.payTo);
     if (still) return refuse(still[0], still[1], { url, verdict });
     const at = Date.now();
     const entry = rules.add({ at, usd: chosen.usd || 0, host, fresh: Boolean(judgment.fresh) });
     if (opts.holdPayments !== false) {
       const until = at + (Number(req.maxTimeoutSeconds) || 60) * 1000;
-      entry.mark = bounded(paidFor, url, { url, payTo: req.payTo, at, until, keep: Math.max(until, at + PAY_TO_CHANGED_MS) });
+      entry.mark = bounded(paidFor, resource, { url: resource, payTo: req.payTo, at, until, keep: Math.max(until, at + PAY_TO_CHANGED_MS) });
     }
     remember(req, entry);
   }

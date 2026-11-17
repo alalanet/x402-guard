@@ -44,15 +44,15 @@ is paid $0.01. If the client still chose a dearer option of a payee that the gua
 on the same network and scheme, the hook refuses it with `cheaper_option` and names the cheaper one.
 
 One open payment per resource: after the hook lets a payment through, a second one for the same
-resource URL is refused while the first is open, until its `validBefore` or else the 402's
-`maxTimeoutSeconds` (`already_paid`), and one to another payee is refused for 15 minutes
-(`pay_to_changed`). A seller that takes the money and asks
-again, asks for a new payout address, or answers "this quote expired, pay the new one" gets one
+resource (the URL the 402 names; for a paid MCP tool, `mcp://tool/<name>`) is refused while the
+first is open, until its `validBefore` or else the 402's `maxTimeoutSeconds` (`already_paid`), and
+one to another payee is refused for 15 minutes (`pay_to_changed`). A seller that takes the money and
+asks again, asks for a new payout address, or answers "this quote expired, pay the new one" gets one
 payment. A settled payment (`PAYMENT-RESPONSE` with `success: true`) or a definite refusal (a
-facilitator code and no transaction) ends it, so the next purchase from that URL goes ahead; the
-client reports these for x402 v2 only, so a v1 payment stays open until its window ends. The 402
-names the resource without its query in many servers: two different purchases from one path, made
-in parallel or from a server that sends no `PAYMENT-RESPONSE`, look like one; set `holdPayments: false`
+facilitator code and no transaction) ends it, so the next purchase from that resource goes ahead;
+the client reports these for x402 v2 only, so a v1 payment stays open until its window ends. Many
+servers name the resource without its query: two different purchases from one path, made in
+parallel or from a server that sends no `PAYMENT-RESPONSE`, look like one; set `holdPayments: false`
 for such a seller. At most 1,000 resources are remembered, the oldest dropped first.
 
 Budgets in this mode: a payment counts from the moment it is approved, so parallel calls cannot all
@@ -204,8 +204,9 @@ still re-sends the held payment. `onNotDelivered: "allow"` turns this off.
 ## Scope and payees
 
 - `allowUrlPrefixes: ["https://api.example.com/v1/"]` pays only URLs under these prefixes (same origin,
-  the path starts with the prefix's), for sellers that share a host by path, like marketplaces. With
-  `allowHosts` too, a URL that matches either list is paid. Otherwise `not_allowed_url`.
+  the path starts with the prefix's), for sellers that share a host by path, like marketplaces. A path
+  with an encoded `/`, `\` or `.` is never under a prefix. With `allowHosts` too, a URL that matches
+  either list is paid. Otherwise `not_allowed_url`.
 - `expectPayTo: { "api.example.com": "0x...", "https://market.example/s/abc/": ["0x...", "0x..."] }`
   refuses any other payTo for those URLs (`pay_to_unexpected`).
 - Look-alikes: an address with the same first and last four characters (after `0x`) as a payee this

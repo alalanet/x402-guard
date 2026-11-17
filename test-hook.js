@@ -602,3 +602,12 @@ test("a cheaper option alalanet does not allow is no reason to refuse; the polic
   assert.deepEqual(h.policy(2, [dear, upto]), [dear, upto]);
   assert.equal(client.constructor, x402Client);
 });
+
+test("paid MCP tools: one open payment per tool, not per server URL", async () => {
+  const { client, signed, calls } = makeClient({ resourceUrl: "https://tools.example/mcp" }, () => ({ decision: "allow" }));
+  await client.createPaymentPayload(required([good], "mcp://tool/weather"));
+  await client.createPaymentPayload(required([good], "mcp://tool/news"));
+  await assert.rejects(client.createPaymentPayload(required([good], "mcp://tool/weather")), /already_paid: .*mcp:\/\/tool\/weather/);
+  assert.deepEqual(calls.map((c) => c.body.url), ["https://tools.example/mcp", "https://tools.example/mcp"]);
+  assert.equal(signed.length, 2);
+});

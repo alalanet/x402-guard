@@ -75,7 +75,8 @@ export interface GuardOptions {
   allowHosts?: string[];
   /**
    * if set, pay only URLs that start with one of these ("https://api.example.com/v1/"): same origin, and
-   * the path (with query) starts with the prefix's. Refused otherwise with not_allowed_url.
+   * the path (with query) starts with the prefix's; a path with an encoded "/", "\" or "." never matches.
+   * Refused otherwise with not_allowed_url.
    */
   allowUrlPrefixes?: string[];
   /**
@@ -116,9 +117,10 @@ export interface GuardOptions {
   /**
    * Double-pay protection (default true). Wrapper: hold the signed payment per purchase (method + URL +
    * body) and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read
-   * on chain) before a new payment may be signed. Hook: per resource URL, refuse a second payment while
-   * the first is open (already_paid) and one to another payee for 15 minutes (pay_to_changed); a settled
-   * payment or a definite refusal ends that. Set false to disable.
+   * on chain) before a new payment may be signed. Hook: per resource (the URL the 402 names, e.g.
+   * mcp://tool/<name>), refuse a second payment while the first is open (already_paid) and one to
+   * another payee for 15 minutes (pay_to_changed); a settled payment or a definite refusal ends that.
+   * Set false to disable.
    */
   holdPayments?: boolean;
   /**

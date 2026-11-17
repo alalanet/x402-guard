@@ -524,3 +524,12 @@ test("a look-alike shares both the first and the last four characters", async ()
     assert.equal(r.status, 402, payTo);
   }
 });
+
+test("allowUrlPrefixes: an encoded slash or dot segment cannot climb out of the prefix", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, allowUrlPrefixes: ["https://shop.example/paid"] });
+  for (const url of ["https://shop.example/paid%2F..%2Frefund", "https://shop.example/paid%2f%2e%2e%2frefund", "https://shop.example/paid/%2e%2e/refund", "https://shop.example/paid%5C..%5Crefund"]) {
+    await assert.rejects(g(url), (e) => e.code === "not_allowed_url", url);
+  }
+  assert.equal((await g("https://shop.example/paid/x%20y")).status, 402);
+});
