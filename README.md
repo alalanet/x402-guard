@@ -148,7 +148,8 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
    room for it, and counted. Any other payment your client signs by itself without a new 402 is
    refused. An approval also lapses at the decision's `expires_at` (read on alalanet's clock through
    its `Date` header) when that comes first, and both modes ask alalanet once more for a decision
-   already past it, then refuse (`decision_expired`).
+   already past it, then refuse (`decision_expired`), also when that second call fails, `failOpen`
+   or not.
 6. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
 
 ## New sellers

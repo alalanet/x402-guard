@@ -630,7 +630,6 @@ export function guardFetch(inner, opts = {}) {
     let verdict;
     try {
       verdict = await preflight(url, header || text, budget.maxUsd);
-      if (expired(verdict)) verdict = await preflight(url, header || text, budget.maxUsd); // once more
     } catch (e) {
       if (opts.failOpen) {
         roomFor(url).push({ lapse: Date.now() + APPROVAL_MS, entry: null, allowed: [] }); // a pass: not checked, not counted
@@ -638,8 +637,11 @@ export function guardFetch(inner, opts = {}) {
       }
       throw new X402GuardError("alalanet_unreachable", `x402-guard: could not get a decision (${e.message}); not paying`, { url });
     }
+    // A decision already past its expiry: ask once more. Its own try: failOpen never covers it, an
+    // expired answer (perhaps a block) is never followed by an unchecked payment.
+    if (expired(verdict)) verdict = await preflight(url, header || text, budget.maxUsd).catch(() => verdict);
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
-    if (expired(verdict)) throw new X402GuardError("decision_expired", `x402-guard: alalanet's decision was past its expiry twice; not paying ${url}`, { url, verdict });
+    if (expired(verdict)) throw new X402GuardError("decision_expired", `x402-guard: alalanet's decision was past its expiry, and asking again did not give a fresh one; not paying ${url}`, { url, verdict });
 
     // From here to the reservation nothing awaits: 402s judged meanwhile have reserved their share.
     const now = budgetLeft(opts, rules.spent, host);
@@ -824,13 +826,14 @@ export function alalanetHooks(opts = {}) {
     let verdict;
     try {
       verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd);
-      if (expired(verdict)) verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd); // once more
     } catch (e) {
       if (opts.failOpen) return remember(req, null);
       return refuse("alalanet_unreachable", `could not get a decision (${e.message}); not paying`, { url });
     }
+    // past its expiry: once more, outside failOpen (an expired answer is never followed by an unchecked payment)
+    if (expired(verdict)) verdict = await preflight(url, JSON.stringify(ctx.paymentRequired), before.maxUsd).catch(() => verdict);
     if (opts.onDecision) opts.onDecision({ url, ...verdict });
-    if (expired(verdict)) return refuse("decision_expired", `alalanet's decision was past its expiry twice; not paying ${url}`, { url, verdict });
+    if (expired(verdict)) return refuse("decision_expired", `alalanet's decision was past its expiry, and asking again did not give a fresh one; not paying ${url}`, { url, verdict });
 
     // From here to the record nothing awaits: payments approved while alalanet answered are counted.
     const left = rules.newLeft();

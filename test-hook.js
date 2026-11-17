@@ -758,3 +758,21 @@ test("hook: a decision already past its expiry is asked again once, then refused
   await assert.rejects(twice.client.createPaymentPayload(required([good])), /x402-guard decision_expired/);
   assert.deepEqual([twice.signed.length, twice.calls.length], [0, 2]);
 });
+
+test("R5-F hook: a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
+  for (const failOpen of [true, false]) {
+    let n = 0;
+    const fetch = async (url, init) => {
+      if (++n === 2) throw new Error("ECONNREFUSED");
+      const pr = JSON.parse(JSON.parse(init.body).payment_required);
+      const options = pr.accepts.map((a) => ({ network: "base", network_id: a.network, asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: 0.002, decision: "block", reasons: ["pay_to_sanctioned"] }));
+      return new Response(JSON.stringify({ decision: "block", options, expires_at: new Date(Date.now() - 1000).toISOString() }), { status: 200 });
+    };
+    const signed = [];
+    const client = new x402Client();
+    client.register("eip155:8453", { scheme: "exact", findDefaultAsset: () => ({ asset: USDC, decimals: 6, symbol: "USDC" }), async createPaymentPayload(v, req) { signed.push(req); return { x402Version: v, payload: {} }; } });
+    alalanetGuard(client, { fetch, detectClient: false, failOpen });
+    await assert.rejects(client.createPaymentPayload(required([good])), /x402-guard decision_expired/, `failOpen ${failOpen}`);
+    assert.deepEqual([signed.length, n], [0, 2]);
+  }
+});
