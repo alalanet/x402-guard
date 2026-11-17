@@ -450,7 +450,7 @@ test("a look-alike of a payee paid before or expected is refused", async () => {
     req.headers.has("PAYMENT-SIGNATURE")
       ? new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx" }) } })
       : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts }) } });
-  const a = alalanet(() => ({ decision: "allow" }));
+  const a = alalanet((o) => (o.payTo === LOOKALIKE ? { decision: "hold", reasons: ["unknown_service"] } : { decision: "allow" }));
   const g = guardFetch(inner, { fetch: a.f });
   await g(URL1);
   await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPayTo(PAYEE, "0x01", in60()) } });
@@ -468,7 +468,7 @@ test("userAgent goes in front of the guard's own", async () => {
   const api = (url, init) => (uas.push(init.headers["user-agent"]), a.f(url, init));
   await guardFetch(server({ accepts: [good] }).inner, { fetch: api, userAgent: "alalanet-review/1" })(URL1);
   await guardFetch(server({ accepts: [good] }).inner, { fetch: api })(URL1);
-  assert.deepEqual(uas, ["alalanet-review/1 x402-guard/1.5 (fetch)", "x402-guard/1.5 (fetch)"]);
+  assert.deepEqual(uas, ["alalanet-review/1 x402-guard/2.0 (fetch)", "x402-guard/2.0 (fetch)"]);
 });
 
 test("a payment that comes after its reservation expired is counted again", async (t) => {
@@ -532,4 +532,142 @@ test("allowUrlPrefixes: an encoded slash or dot segment cannot climb out of the 
     await assert.rejects(g(url), (e) => e.code === "not_allowed_url", url);
   }
   assert.equal((await g("https://shop.example/paid/x%20y")).status, 402);
+});
+
+// --- 2.0 round 2: review-1116 guard15 probes, adopted --------------------------------------------
+
+const NEWHOLD = { decision: "hold", reasons: ["unknown_service", "testnet"] };
+const sellerOf = (acceptsFor) => async (req) =>
+  req.headers.has("PAYMENT-SIGNATURE")
+    ? new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx", network: "eip155:8453" }) } })
+    : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: acceptsFor(req.url) }) } });
+
+test("Q1a/Q1b the new-seller day cap is per guard object: all new sellers together, a new guard starts again", async () => {
+  let n = 0;
+  const addr = (k) => "0x" + k.toString(16).padStart(40, "0");
+  const g = guardFetch(sellerOf(() => [{ ...good, amount: "50000", payTo: addr(++n) }]), { fetch: alalanet(() => NEWHOLD).f });
+  let paid = 0;
+  for (let i = 0; i < 10; i++) {
+    const url = `https://s${i}.evil.example/x`;
+    try {
+      await g(url);
+      await g(url, { headers: { "PAYMENT-SIGNATURE": evmPayTo(addr(n), "0x" + i, in60()) } });
+      paid++;
+    } catch (e) {
+      assert.equal(e.code, "held");
+    }
+  }
+  assert.equal(paid, 5);
+  const fresh = guardFetch(sellerOf(() => [{ ...good, amount: "50000" }]), { fetch: alalanet(() => NEWHOLD).f });
+  assert.equal((await fresh("https://e0.example/x")).status, 402);
+});
+
+test("Q3a at most 100 402s wait for their payment per URL: the 101st is refused, nothing goes uncounted", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(sellerOf(() => [{ ...good, amount: "10000" }]), { fetch: a.f, maxUsdPerDay: 1.01 });
+  for (let i = 0; i < 100; i++) await g(URL1);
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget" && /waiting/.test(e.message));
+  for (let i = 0; i < 100; i++) await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x" + i.toString(16), in60()) } });
+  assert.equal((await g("https://shop.example/more")).status, 402); // $0.01 left, $0.01 asked: fits
+  await g("https://shop.example/more", { headers: { "PAYMENT-SIGNATURE": evmPay("0xff", in60()) } });
+  await assert.rejects(g("https://shop.example/last"), (e) => e.code === "over_budget");
+});
+
+test("Q3b a payment that comes after its reservation expired is checked against the budget again", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const sent = [];
+  const inner = async (req) => (req.headers.has("PAYMENT-SIGNATURE") && sent.push(req.url), sellerOf(() => [good])(req));
+  const g = guardFetch(inner, { fetch: a.f, maxUsdPerDay: 0.002 });
+  await g("https://shop.example/a");
+  t.mock.timers.tick(5 * 60 * 1000 + 1);
+  await g("https://shop.example/b");
+  await g("https://shop.example/b", { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", in60()) } });
+  await assert.rejects(g("https://shop.example/a", { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", in60()) } }), (e) => e.code === "over_budget");
+  assert.deepEqual(sent, ["https://shop.example/b"], "the late payment never left");
+});
+
+test("Q4a a URL prefix matches at a path segment boundary only", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(sellerOf(() => [good]), { fetch: a.f, allowUrlPrefixes: ["https://market.example/s/abc"] });
+  for (const u of ["https://market.example/s/abcevil/pay", "https://market.example/s/abc-refund"]) await assert.rejects(g(u), (e) => e.code === "not_allowed_url", u);
+  for (const u of ["https://market.example/s/abc", "https://market.example/s/abc/pay", "https://market.example/s/abc?x=1"]) assert.equal((await g(u)).status, 402, u);
+  const slash = guardFetch(sellerOf(() => [good]), { fetch: a.f, allowUrlPrefixes: ["https://market.example/s/abc/"] });
+  assert.equal((await slash("https://market.example/s/abc/pay")).status, 402);
+  await assert.rejects(slash("https://market.example/s/abc"), (e) => e.code === "not_allowed_url");
+});
+
+test("Q4b a path with ';' (Tomcat, Jetty and Spring read '..;' as '..') never matches a prefix", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(sellerOf(() => [good]), { fetch: a.f, allowUrlPrefixes: ["https://market.example/s/abc/"] });
+  for (const u of ["https://market.example/s/abc/..;/evil/pay", "https://market.example/s/abc/x;jsessionid=1"]) await assert.rejects(g(u), (e) => e.code === "not_allowed_url", u);
+});
+
+test("Q4c look-alike memory is per host, and a payee alalanet allows is not refused for looking like one paid", async () => {
+  const HONEST = "0x1234" + "5".repeat(32) + "abcd";
+  const GROUND = "0x1234" + "e".repeat(32) + "abcd";
+  let payTo = GROUND;
+  const a = alalanet((o) => (o.payTo === HONEST ? { decision: "allow" } : NEWHOLD));
+  const g = guardFetch(sellerOf(() => [{ ...good, payTo }]), { fetch: a.f });
+  await g("https://evil.example/x");
+  await g("https://evil.example/x", { headers: { "PAYMENT-SIGNATURE": evmPayTo(GROUND, "0x1", in60()) } });
+  payTo = HONEST;
+  assert.equal((await g("https://honest.example/x")).status, 402, "another host");
+  assert.equal((await g("https://evil.example/y")).status, 402, "same host, but alalanet allows it");
+});
+
+test("Q-extra cheapest is per payee, network and asset: a cheaper other asset does not withhold USDC", async () => {
+  const USDT = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
+  const a = alalanet((o) => ({ decision: "allow", network_id: o.network }));
+  const g = guardFetch(sellerOf(() => [{ ...good, amount: "500000" }, { ...good, asset: USDT, amount: "400000" }]), { fetch: a.f });
+  const accepts = unb64((await g(URL1)).headers.get("PAYMENT-REQUIRED")).accepts;
+  assert.deepEqual(accepts.map((x) => x.asset), [USDT, good.asset]);
+});
+
+test("Q-extra not_delivered_before: another purchase on the same URL is new money; the mark is per host", async () => {
+  const inner = async (req) =>
+    req.headers.has("PAYMENT-SIGNATURE") ? new Response("oops", { status: 500 }) : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+  const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
+  const U = "https://shop.example/rpc";
+  await g(U, { method: "POST", body: "a" });
+  await g(U, { method: "POST", body: "a", headers: { "PAYMENT-SIGNATURE": evmPay("0x01", in60()) } });
+  assert.equal((await g(U, { method: "POST", body: "a" })).status, 402, "the same purchase: the held payment goes again");
+  await assert.rejects(g(U, { method: "POST", body: "b" }), (e) => e.code === "not_delivered_before");
+  assert.equal((await g("https://platform-seller.example/x")).status, 402, "the same payee on another host");
+});
+
+test("a late payment is refused when the budget has some room, but not enough", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(sellerOf(() => [good]), { fetch: a.f, maxUsdPerDay: 0.003 });
+  await g("https://shop.example/a");
+  t.mock.timers.tick(5 * 60 * 1000 + 1);
+  await g("https://shop.example/b");
+  await g("https://shop.example/b", { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", in60()) } });
+  await assert.rejects(g("https://shop.example/a", { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", in60()) } }), (e) => e.code === "over_budget"); // 0.001 left
+});
+
+test("reservations wait a day for their payment, then make room for new 402s", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const g = guardFetch(sellerOf(() => [good]), { fetch: alalanet(() => ({ decision: "allow" })).f });
+  for (let i = 0; i < 100; i++) await g(URL1);
+  t.mock.timers.tick(23 * 60 * 60 * 1000);
+  await assert.rejects(g(URL1), (e) => /waiting/.test(e.message));
+  t.mock.timers.tick(60 * 60 * 1000 + 1);
+  assert.equal((await g(URL1)).status, 402);
+});
+
+test("an expectPayTo prefix applies to every URL that starts with it, ';' paths too", async () => {
+  const g = guardFetch(sellerOf(() => [good]), { fetch: alalanet(() => ({ decision: "allow" })).f, expectPayTo: { "https://market.example/s/abc/": "0xBBB" } });
+  await assert.rejects(g("https://market.example/s/abc/..;/x"), (e) => e.code === "pay_to_unexpected");
+});
+
+test("preflight's quote_expired (block) and price_differs_from_description (hold) are never paid as new", async () => {
+  const expired = alalanet(() => ({ decision: "block", reasons: ["quote_expired", "unknown_service", "testnet"] }));
+  for (const onHold of [undefined, "allow"]) {
+    await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: expired.f, onHold })(URL1), (e) => e.code === "blocked" && e.reasons.includes("quote_expired"));
+  }
+  const described = alalanet(() => ({ decision: "hold", reasons: ["price_differs_from_description", "unknown_service", "testnet"] }));
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: described.f })(URL1), (e) => e.code === "held" && e.reasons.includes("price_differs_from_description"));
+  assert.equal((await guardFetch(server({ accepts: [good] }).inner, { fetch: described.f, onHold: "allow" })(URL1)).status, 402);
 });

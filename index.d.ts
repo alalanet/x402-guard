@@ -1,3 +1,20 @@
+/**
+ * Reasons alalanet gives per option (more may come: under onHold "new" a hold with a reason the guard
+ * does not know is refused). block: never paid. hold: paid as a new seller only when every reason is
+ * unknown_service, not_checked_yet, not_rated_yet or pay_to_never_seen, besides info reasons.
+ */
+export type PreflightReason =
+  // block
+  | "pay_to_unknown" | "pay_to_zero_address" | "pay_to_burn_address" | "pay_to_is_asset" | "pay_to_sanctioned"
+  | "pay_to_frozen_by_issuer" | "service_not_working" | "over_budget" | "quote_expired"
+  // hold: the seller is new to alalanet
+  | "unknown_service" | "not_checked_yet" | "not_rated_yet" | "pay_to_never_seen"
+  // hold: compared against data
+  | "pay_to_differs_from_listing" | "price_above_listing" | "price_above_observed" | "price_differs_from_description"
+  | "network_not_listed" | "asset_not_stablecoin" | "price_not_comparable_to_budget" | "high_price" | "low_trust_score"
+  // info
+  | "pay_to_as_observed" | "pay_to_platform_wallet" | "amount_is_ceiling" | "frozen_status_unknown" | "testnet";
+
 export interface PreflightOption {
   network: string;
   /** the option's network as the 402 spells it (eip155:8453); sent by alalanet since 2026-11-10 */
@@ -8,7 +25,7 @@ export interface PreflightOption {
   usd?: number;
   pay_to: string;
   decision: "allow" | "hold" | "block";
-  reasons?: string[];
+  reasons?: (PreflightReason | (string & {}))[];
   payment_hash: string;
 }
 
@@ -75,24 +92,27 @@ export interface GuardOptions {
   allowHosts?: string[];
   /**
    * if set, pay only URLs that start with one of these ("https://api.example.com/v1/"): same origin, and
-   * the path (with query) starts with the prefix's; a path with an encoded "/", "\" or "." never matches.
-   * Refused otherwise with not_allowed_url.
+   * the path (with query) starts with the prefix's at a segment boundary; a path with an encoded "/",
+   * "\" or ".", or with a ";", never matches. Refused otherwise with not_allowed_url.
    */
   allowUrlPrefixes?: string[];
   /**
-   * the payee you expect, per host ("api.example.com", "*.example.com") or URL prefix ("https://..."):
-   * one address or several. Any other payTo for a matching URL is refused (pay_to_unexpected). These
-   * addresses and every payee this guard paid are also compared against look-alikes (same first and
-   * last four characters, another address: pay_to_lookalike).
+   * the payee you expect, per host ("api.example.com", "*.example.com") or URL prefix ("https://...",
+   * applied to every URL that starts with it): one address or several. Any other payTo for a matching
+   * URL is refused (pay_to_unexpected). Look-alikes (same first and last four characters, another
+   * address) of these and of payees this guard paid on the same host are refused (pay_to_lookalike);
+   * an option alalanet allows is not compared with the paid ones.
    */
   expectPayTo?: Record<string, string | string[]>;
   /**
    * what to do with "hold" options (default "new"): "new" pays a hold whose only reasons say the seller
    * is new to alalanet (unknown_service, not_checked_yet, not_rated_yet, pay_to_never_seen, besides
-   * information-only reasons), within the newSeller caps; "block" pays no hold; "allow" pays every hold
+   * information-only reasons), within the newSeller caps; "block" pays no hold (the 1.x default);
+   * "allow" pays every hold. Hook: a new seller is not paid while allowHosts or allowUrlPrefixes is set
+   * and the 402 names the URL, unless expectPayTo pins its payee or a resourceUrl function chose the URL.
    */
   onHold?: "new" | "block" | "allow";
-  /** caps for holds paid by onHold "new" (default 0.05 USD a payment, 0.25 USD a rolling 24 h) */
+  /** caps for holds paid by onHold "new" (default 0.05 USD a payment, 0.25 USD a rolling 24 h), in memory per guard object */
   newSeller?: { maxUsdPerCall?: number; maxUsdPerDay?: number };
   /**
    * if alalanet cannot be reached: refuse to pay (false, default) or let the payment go ahead unchecked
@@ -119,14 +139,16 @@ export interface GuardOptions {
    * body) and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read
    * on chain) before a new payment may be signed. Hook: per resource (the URL the 402 names, e.g.
    * mcp://tool/<name>), refuse a second payment while the first is open (already_paid) and one to
-   * another payee for 15 minutes (pay_to_changed); a settled payment or a definite refusal ends that.
+   * another payee for 15 minutes unless alalanet allows that payee (pay_to_changed); a settled payment
+   * or a definite refusal ends that.
    * Set false to disable.
    */
   holdPayments?: boolean;
   /**
-   * Wrapper only. A payee that took a payment and answered without delivering (a non-2xx answer that is
-   * not a definite refusal): "block" (default) refuses new payments to it for the guard's lifetime
-   * (not_delivered_before; a retry of the same purchase still re-presents the held payment); "allow" pays it.
+   * Wrapper only. A payee that took a payment on a host and answered without delivering (a non-2xx answer
+   * that is not a definite refusal): "block" (default) refuses new payments to it on that host for the
+   * guard's lifetime (not_delivered_before; a retry of the same purchase, method + URL + body, still
+   * re-presents the held payment); "allow" pays it.
    */
   onNotDelivered?: "block" | "allow";
   /** called when a retry re-presents the held payment instead of a newly signed one */

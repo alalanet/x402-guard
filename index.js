@@ -169,14 +169,20 @@ function hostMatches(host, patterns) {
   });
 }
 
-// A URL prefix matches on the same origin, by the start of the path (and query). A path with an
-// encoded slash, backslash or dot could be decoded by the server into another path: never a match.
-function prefixMatches(url, prefix) {
+// A URL prefix matches on the same origin, by the start of the path (and query). strict (allow
+// lists): only at a segment boundary, and never a path with an encoded slash, backslash or dot or a
+// ';' (Tomcat, Jetty and Spring read "..;" as ".."), which the server could resolve into another path.
+// Not strict (expectPayTo): any URL that starts with the prefix, so the pin applies on the safe side.
+function prefixMatches(url, prefix, strict = true) {
   try {
     const u = new URL(url);
     const p = new URL(prefix);
-    if (/%2f|%5c|%2e/i.test(u.pathname)) return false;
-    return u.origin === p.origin && (u.pathname + u.search).startsWith(p.pathname + p.search);
+    const path = u.pathname + u.search;
+    const start = p.pathname + p.search;
+    if (u.origin !== p.origin || !path.startsWith(start)) return false;
+    if (!strict) return true;
+    if (/%2f|%5c|%2e|;/i.test(u.pathname)) return false;
+    return path.length === start.length || start.endsWith("/") || "/?&".includes(path[start.length]);
   } catch {
     return false;
   }
@@ -209,13 +215,15 @@ function payeeOf(value) {
   }
 }
 
-const VERSION = "1.5";
+const VERSION = "2.0";
 const MEMORY = 1000; // entries kept per guard: payees paid, resources paid, sellers that did not deliver
 const RESERVE_MS = 5 * 60 * 1000; // wrapper: how long an approved 402 waits for its payment
 const PAY_TO_CHANGED_MS = 15 * 60 * 1000; // hook: how long a resource just paid may not ask for another payee
 
 // alalanet's hold reasons that only say it has no data on the seller yet. Every other hold reason
-// compares the payment against data (a listing, earlier 402s, the trust score, the asset).
+// compares the payment against data (a listing, earlier 402s, the trust score, the asset, the 402's
+// own description: price_differs_from_description), and so does any reason the guard does not know;
+// none of those is paid as new. Blocks (quote_expired, over_budget, ...) are never paid.
 const NEW_SELLER = new Set(["unknown_service", "not_checked_yet", "not_rated_yet", "pay_to_never_seen"]);
 // reasons alalanet gives as information only
 const INFO = new Set(["testnet", "frozen_status_unknown", "pay_to_as_observed", "pay_to_platform_wallet", "amount_is_ceiling"]);
@@ -301,12 +309,16 @@ function makeRules(opts) {
     const reasons = o.reasons || [];
     return reasons.some((r) => NEW_SELLER.has(r)) && reasons.every((r) => NEW_SELLER.has(r) || INFO.has(r));
   };
-  // May this option be paid? {pay, fresh}; why: a new seller over the new-seller caps.
-  function judge(o, left) {
+  // May this option be paid? {pay, fresh}; why: a new seller over the new-seller caps. scoped: the
+  // URL checked was named by the 402 while allow lists are set, so they cannot bound a new seller.
+  function judge(o, left, scoped = false) {
     if (o.decision === "allow") return { pay: true };
     if (o.decision !== "hold") return { pay: false };
     if (onHold === "allow") return { pay: true };
     if (onHold !== "new" || !isNew(o)) return { pay: false };
+    if (scoped) {
+      return { pay: false, why: "the 402 names the URL, so your allowHosts / allowUrlPrefixes cannot bound a new seller (pin its payee with expectPayTo, or use guardFetch)" };
+    }
     if (typeof o.usd !== "number") return { pay: false, why: "a new seller's price is unknown in US dollars" };
     if (o.usd > capCall + 1e-9) return { pay: false, why: `a new seller's ${o.usd} USD is over the new-seller cap of ${capCall} USD a payment` };
     if (o.usd > left + 1e-9) {
@@ -316,8 +328,11 @@ function makeRules(opts) {
   }
 
   const pins = Object.entries(opts.expectPayTo || {}).map(([where, payTo]) => [where, [].concat(payTo)]);
-  const paid = new Map(); // payee key -> address: payees this guard paid
-  const covers = (url, host, where) => (/^https?:\/\//i.test(where) ? prefixMatches(url, where) : hostMatches(host, [where]));
+  const paid = new Map(); // "host payee" -> {host, payTo}: payees this guard paid, per host
+  const covers = (url, host, where) => (/^https?:\/\//i.test(where) ? prefixMatches(url, where, false) : hostMatches(host, [where]));
+  const pinsFor = (url, host) => pins.filter(([where]) => covers(url, host, where));
+  // the URL has a pin and this payee is on it
+  const pinned = (url, host, payTo) => pinsFor(url, host).some(([, list]) => list.some((p) => samePayee(p, payTo)));
 
   // [code, why] when the URL is outside the caller's scope.
   function outOfScope(url, host) {
@@ -331,26 +346,26 @@ function makeRules(opts) {
     return ["not_allowed_host", `${host} is not on your allow list`];
   }
 
-  // [code, why] when this payee must not be paid for this URL.
-  function badPayee(url, host, payTo) {
-    const mine = pins.filter(([where]) => covers(url, host, where));
-    if (mine.length) {
-      if (mine.some(([, list]) => list.some((p) => samePayee(p, payTo)))) return null;
-      return ["pay_to_unexpected", `${payTo} is not the payee you expect for ${url}`];
-    }
-    const like = [...paid.values(), ...pins.flatMap(([, list]) => list)].find((p) => lookalike(p, payTo));
-    if (like) return ["pay_to_lookalike", `${payTo} looks like ${like}, which you paid or expect, but is another address`];
+  // [code, why] when this payee must not be paid for this URL. paidToo: also compare it with the
+  // payees paid on this host (not done for an option alalanet allows: its listing vouches for it, and
+  // a ground look-alike paid once must not lock the honest payee out).
+  function badPayee(url, host, payTo, paidToo) {
+    if (pinsFor(url, host).length) return pinned(url, host, payTo) ? null : ["pay_to_unexpected", `${payTo} is not the payee you expect for ${url}`];
+    const known = pins.flatMap(([, list]) => list);
+    if (paidToo) for (const p of paid.values()) if (p.host === host) known.push(p.payTo);
+    const like = known.find((p) => lookalike(p, payTo));
+    if (like) return ["pay_to_lookalike", `${payTo} looks like ${like}, which you paid on ${host} or expect, but is another address`];
     return null;
   }
-  const rememberPayee = (payTo) => payTo && bounded(paid, payeeKey(payTo), String(payTo));
+  const rememberPayee = (host, payTo) => payTo && bounded(paid, `${host} ${payeeKey(payTo)}`, { host, payTo: String(payTo) });
 
-  return { spent, add, drop, newLeft, judge, outOfScope, badPayee, rememberPayee };
+  return { spent, add, drop, newLeft, judge, outOfScope, badPayee, pinned, rememberPayee };
 }
 
-// The cheapest allowed options per payee and network (every one at that price), cheapest first;
-// options without a dollar price after the others.
+// The cheapest allowed options per payee, network and asset (every one at that price), cheapest
+// first; options without a dollar price after the others.
 function cheapestFirst(options) {
-  const group = (o) => `${payeeKey(o.pay_to)} ${String(o.network_id ?? o.network).toLowerCase()}`;
+  const group = (o) => `${payeeKey(o.pay_to)} ${String(o.network_id ?? o.network).toLowerCase()} ${String(o.asset).toLowerCase()}`;
   const min = new Map();
   for (const o of options) {
     if (typeof o.usd !== "number") continue;
@@ -370,9 +385,9 @@ function cheapestFirst(options) {
 export function guardFetch(inner, opts = {}) {
   const { api, call, ua, preflight } = makePreflight(opts, "fetch");
   const rules = makeRules(opts);
-  const pending = new Map(); // url -> [{entry, allowed}]: approved 402s waiting for their payment, oldest first
+  const pending = new Map(); // url -> [{at, entry, allowed}]: approved 402s waiting for their payment, oldest first
   const holds = new Map(); // purchase key -> held payment {header, value, info, until, settledTx?, entry?}
-  const notDelivered = new Map(); // payee key -> {payTo, at}: took a payment and did not deliver
+  const notDelivered = new Map(); // "host payee" -> {payTo, at}: took a payment there and did not deliver
   const SVM_WINDOW_MS = 60 * 1000; // a Solana blockhash is valid for about 60-90 s
 
   function windowEnd(info) {
@@ -460,15 +475,21 @@ export function guardFetch(inner, opts = {}) {
   }
 
   // The oldest reservation for this URL, bound to the payment that is going out: counted from now
-  // on (again, if it had expired), until a definite failure.
+  // on, until a definite failure. One that expired (the payer took more than RESERVE_MS) stopped
+  // counting, so the budgets must have room for it again, or nothing is sent.
   function takeReservation(url) {
     const queue = pending.get(url) || [];
     const r = queue.shift();
     if (!queue.length) pending.delete(url);
-    if (r) {
-      rules.drop(r.entry);
-      r.entry = rules.add({ at: Date.now(), usd: r.entry.usd, host: r.entry.host, fresh: r.entry.fresh });
+    if (!r) return r;
+    const { usd, host, fresh, until } = r.entry;
+    rules.drop(r.entry);
+    if (until <= Date.now()) {
+      const b = budgetLeft(opts, rules.spent, host);
+      const room = !b.over && (b.maxUsd === undefined || usd <= b.maxUsd + 1e-9) && (!fresh || usd <= rules.newLeft() + 1e-9);
+      if (!room) throw new X402GuardError("over_budget", "x402-guard: this payment came more than 5 minutes after its 402 and your budget has no room for it now; not sending it", { url });
     }
+    r.entry = rules.add({ at: Date.now(), usd, host, fresh });
     return r;
   }
 
@@ -496,6 +517,8 @@ export function guardFetch(inner, opts = {}) {
     let request = new Request(input, init);
     const url = request.url;
     const isPaid = PAID_HEADERS.some((h) => request.headers.has(h));
+    // to tell a retry of a held purchase from a new one if a payee here did not deliver
+    const probe = !isPaid && notDelivered.size && request.body ? request.clone() : request;
     let key, held, created, reserved;
     if (isPaid) {
       reserved = takeReservation(url);
@@ -533,8 +556,9 @@ export function guardFetch(inner, opts = {}) {
       const usd = approved.length ? Math.max(...approved.map((o) => o.usd || 0)) : 0;
       const paid = settle.success === true || (settle.success !== false && response.ok);
       const payTo = payeeOf(request.headers.get(PAID_HEADERS.find((h) => request.headers.has(h))));
-      if (paid) rules.rememberPayee(payTo);
-      if (!response.ok && !definite && payTo && opts.onNotDelivered !== "allow") bounded(notDelivered, payeeKey(payTo), { payTo, at: Date.now() });
+      const paidHost = new URL(url).hostname.toLowerCase();
+      if (paid) rules.rememberPayee(paidHost, payTo);
+      if (!response.ok && !definite && payTo && opts.onNotDelivered !== "allow") bounded(notDelivered, `${paidHost} ${payeeKey(payTo)}`, { payTo, at: Date.now() });
       const info = { url, paid, status: response.status, tx: settle.transaction, network: settle.network, payer: settle.payer, usd: paid ? usd : 0, response };
       if (opts.onPaid) await opts.onPaid(info);
       if (opts.report && paid && info.tx && info.network) {
@@ -556,6 +580,8 @@ export function guardFetch(inner, opts = {}) {
 
     const budget = budgetLeft(opts, rules.spent, host);
     if (budget.over) throw new X402GuardError("over_budget", budget.over, { url });
+    // a retry of a purchase whose payment is held re-presents that payment: no new money to that payee
+    const retrying = notDelivered.size > 0 && holds.has(await purchaseKey(probe));
 
     let verdict;
     try {
@@ -574,12 +600,10 @@ export function guardFetch(inner, opts = {}) {
     const left = rules.newLeft();
     const judged = new Map(options.map((o) => [o, rules.judge(o, left)]));
     const ok = options.filter((o) => judged.get(o).pay);
-    // a retry of a purchase whose payment is held re-presents that payment: no new money to that payee
-    const retrying = [...holds.keys()].some((k) => k.startsWith(`${request.method} ${url} `));
     const refusal = (o) => {
-      const bad = rules.badPayee(url, host, o.pay_to);
+      const bad = rules.badPayee(url, host, o.pay_to, o.decision !== "allow");
       if (bad) return bad;
-      if (!retrying && notDelivered.has(payeeKey(o.pay_to))) {
+      if (!retrying && notDelivered.has(`${host} ${payeeKey(o.pay_to)}`)) {
         return ["not_delivered_before", `${o.pay_to} took a payment and did not deliver; not paying it again (onNotDelivered: "allow" pays it)`];
       }
       return null;
@@ -604,11 +628,21 @@ export function guardFetch(inner, opts = {}) {
         url, decision: verdict.decision, reasons, verdict,
       });
     }
-    // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes).
+    // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes). A
+    // reservation waits up to a day for its payment; at most 100 per URL and MEMORY URLs wait, and
+    // past that the 402 is refused: a dropped one would leave its payment uncounted.
     const at = Date.now();
+    for (const [u, q] of pending) {
+      while (q.length && at - q[0].at > DAY_MS) q.shift();
+      if (!q.length) pending.delete(u);
+    }
+    const queue = pending.get(url) || [];
+    if (queue.length >= 100 || (!queue.length && pending.size >= MEMORY)) {
+      throw new X402GuardError("over_budget", `x402-guard: too many 402s are waiting for their payment (${queue.length ? `100 for ${url}` : `${MEMORY} URLs`}); not paying ${url}`, { url, verdict });
+    }
     const entry = rules.add({ at, usd: Math.max(...allowed.map((o) => o.usd || 0)), host, fresh: allowed.some((o) => judged.get(o).fresh), until: at + RESERVE_MS });
-    const queue = bounded(pending, url, pending.get(url) || []);
-    if (queue.push({ entry, allowed }) > 100) queue.shift();
+    queue.push({ at, entry, allowed });
+    pending.set(url, queue);
 
     // Hand the payer only the allowed options, in the order of `allowed` (cheapest first).
     const rank = (a) => allowed.findIndex((o) => optionMatches(a, [o]) && (o.network_id === undefined || same(o.network_id, a.network)));
@@ -703,12 +737,13 @@ export function alalanetHooks(opts = {}) {
     return { abort: true, reason: `x402-guard ${code}: ${message}` };
   };
 
-  // [code, why] when a payment for this resource is still open, or it was just paid to another payee.
-  function repeat(url, payTo) {
+  // [code, why] when a payment for this resource is still open, or it was just paid to another payee
+  // that alalanet does not vouch for (allow: it matches the listing).
+  function repeat(url, payTo, vouched) {
     const m = paidFor.get(url);
     const now = Date.now();
     if (!m || now >= m.keep) return null;
-    if (!samePayee(m.payTo, payTo)) return ["pay_to_changed", `${url} was just paid to ${m.payTo} and now asks for ${payTo}; not paying the new address`];
+    if (!samePayee(m.payTo, payTo)) return vouched ? null : ["pay_to_changed", `${url} was just paid to ${m.payTo} and now asks for ${payTo}; not paying the new address`];
     if (now < m.until) return ["already_paid", `a payment for ${url} went out ${Math.round((now - m.at) / 1000)} s ago and is still open; not paying again`];
     return null;
   }
@@ -735,12 +770,12 @@ export function alalanetHooks(opts = {}) {
     const host = new URL(url).hostname.toLowerCase();
     const scope = rules.outOfScope(url, host);
     if (scope) return refuse(scope[0], scope[1], { url });
-    const payee = rules.badPayee(url, host, req.payTo);
+    const payee = rules.badPayee(url, host, req.payTo, false);
     if (payee) return refuse(payee[0], `${payee[1]}; not paying ${url}`, { url });
     const before = budgetLeft(opts, rules.spent, host);
     if (before.over) return refuse("over_budget", before.over.replace(/^x402-guard: /, ""), { url });
     const resource = named || url;
-    const open = repeat(resource, req.payTo);
+    const open = repeat(resource, req.payTo, true); // another payee waits for alalanet's verdict
     if (open) return refuse(open[0], open[1], { url });
 
     let verdict;
@@ -754,13 +789,16 @@ export function alalanetHooks(opts = {}) {
 
     // From here to the record nothing awaits: payments approved while alalanet answered are counted.
     const left = rules.newLeft();
+    // the 402 named the URL: allow lists bound a new seller only through a pinned payee
+    const fromThe402 = Boolean(opts.allowHosts || opts.allowUrlPrefixes) && typeof opts.resourceUrl !== "function" && url === named;
+    const judge = (o) => rules.judge(o, left, fromThe402 && !rules.pinned(url, host, o.pay_to));
     const options = verdict.options || [];
     const chosen = verdictFor(req, options);
-    const judgment = chosen && rules.judge(chosen, left);
+    const judgment = chosen && judge(chosen);
     if (!chosen || !judgment.pay) {
       const reasons = chosen?.reasons?.length ? chosen.reasons : [...new Set(options.flatMap((o) => o.reasons || []))];
       const decision = chosen?.decision || verdict.decision || "block";
-      const others = options.filter((o) => o !== chosen && rules.judge(o, left).pay);
+      const others = options.filter((o) => o !== chosen && judge(o).pay);
       const instead = others.length ? `; allowed instead: ${others.map((o) => `${o.pay_to} ${o.amount} on ${o.network}`).join(", ")}` : "";
       const why = judgment?.why ? `; ${judgment.why}` : "";
       return refuse(decision === "hold" ? "held" : "blocked", `alalanet says ${decision} (${reasons.join(", ") || "no reason"})${why}; not paying ${url}${instead}`, {
@@ -772,7 +810,7 @@ export function alalanetHooks(opts = {}) {
     const cheaper = options.find(
       (o) =>
         typeof o.usd === "number" && typeof chosen.usd === "number" && o.usd < chosen.usd - 1e-12 &&
-        samePayee(o.pay_to, chosen.pay_to) && sameNetwork(o, chosen) && rules.judge(o, left).pay &&
+        samePayee(o.pay_to, chosen.pay_to) && sameNetwork(o, chosen) && same(o.asset, chosen.asset) && judge(o).pay &&
         accepts.some((a) => a.scheme === req.scheme && optionMatches(a, [o])),
     );
     if (cheaper) {
@@ -791,7 +829,10 @@ export function alalanetHooks(opts = {}) {
         return refuse("over_budget", `${chosen.usd} USD is over what is left of your budget (${now.maxUsd}); not paying ${url}`, { url, verdict });
       }
     }
-    const still = repeat(resource, req.payTo);
+    const vouched = chosen.decision === "allow";
+    const like = rules.badPayee(url, host, req.payTo, !vouched);
+    if (like) return refuse(like[0], `${like[1]}; not paying ${url}`, { url, verdict });
+    const still = repeat(resource, req.payTo, vouched);
     if (still) return refuse(still[0], still[1], { url, verdict });
     const at = Date.now();
     const entry = rules.add({ at, usd: chosen.usd || 0, host, fresh: Boolean(judgment.fresh) });
@@ -805,8 +846,8 @@ export function alalanetHooks(opts = {}) {
   // The payment was created: its payee counts as paid (look-alikes of it are refused), and its own
   // validBefore, when it has one, says how long it stays open.
   async function onAfterPaymentCreation(ctx) {
-    rules.rememberPayee(ctx.selectedRequirements?.payTo);
     const e = (byOption.get(ctx.selectedRequirements) || []).at(-1);
+    if (e) rules.rememberPayee(e.host, ctx.selectedRequirements.payTo);
     const vb = Number(ctx.paymentPayload?.payload?.authorization?.validBefore);
     if (current(e) && vb > 0) {
       e.mark.until = vb * 1000;

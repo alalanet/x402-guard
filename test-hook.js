@@ -45,7 +45,7 @@ test("a blocked payment is refused before it is signed", async () => {
   await assert.rejects(client.createPaymentPayload(required([good])), /Payment creation aborted: x402-guard blocked: .*sanctioned_pay_to/);
   assert.deepEqual(signed, []);
   assert.equal(calls[0].body.url, "https://shop.example/paid");
-  assert.equal(calls[0].ua, "x402-guard/1.5 (hook)");
+  assert.equal(calls[0].ua, "x402-guard/2.0 (hook)");
   assert.equal(JSON.parse(calls[0].body.payment_required).accepts[0].payTo, "0xAAA");
 });
 
@@ -470,11 +470,12 @@ test("a cheaper option on another network, asset or scheme is not a reason to re
   const dear = { ...good, amount: "500000" };
   await c.createPaymentPayload(required([dear, { ...good, network: "eip155:1" }], "https://shop.example/a"));
   await c.createPaymentPayload(required([dear, { ...good, scheme: "upto" }], "https://shop.example/b"));
-  assert.deepEqual(signed, ["500000", "500000"]);
+  await c.createPaymentPayload(required([dear, { ...good, asset: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2" }], "https://shop.example/c"));
+  assert.deepEqual(signed, ["500000", "500000", "500000"]);
 });
 
 test("the hook does not pay a resource again while its payment is open, nor to a new payee", async () => {
-  const { client, signed } = makeClient({}, () => ({ decision: "allow" }));
+  const { client, signed } = makeClient({}, (a) => (a.payTo === "0xEVIL" ? { decision: "hold", reasons: ["pay_to_never_seen"] } : { decision: "allow" }));
   await client.createPaymentPayload(required([good]));
   await assert.rejects(client.createPaymentPayload(required([good])), /x402-guard already_paid/);
   await assert.rejects(client.createPaymentPayload(required([evil])), /x402-guard pay_to_changed: .*0xAAA.*0xEVIL/);
@@ -517,7 +518,7 @@ test("the memory lasts until the payment's validBefore; a new payee stays refuse
   });
   const fetch = async (url, init) => {
     const pr = JSON.parse(JSON.parse(init.body).payment_required);
-    const options = pr.accepts.map((a) => ({ network: "base", network_id: a.network, asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: 0.002, decision: "allow" }));
+    const options = pr.accepts.map((a) => ({ network: "base", network_id: a.network, asset: a.asset, amount: a.amount, pay_to: a.payTo, usd: 0.002, ...(a.payTo === "0xEVIL" ? { decision: "hold", reasons: ["unknown_service"] } : { decision: "allow" }) }));
     return new Response(JSON.stringify({ decision: "allow", options }), { status: 200 });
   };
   alalanetGuard(client, { fetch, detectClient: false });
@@ -543,7 +544,7 @@ test("a payment approved but never created leaves no mark", async () => {
   await client.createPaymentPayload(required([good]));
 });
 
-test("hook: allowUrlPrefixes, expectPayTo and look-alikes are refused before alalanet is asked", async () => {
+test("hook: allowUrlPrefixes and expectPayTo are refused before alalanet is asked; a look-alike of a payee paid on that host after it", async () => {
   const PAYEE = "0x1234" + "5".repeat(32) + "abcd";
   const LOOK = "0x1234" + "d3ad".repeat(8) + "abcd";
   const scoped = makeClient({ allowUrlPrefixes: ["https://shop.example/paid"] }, () => ({ decision: "allow" }));
@@ -553,16 +554,17 @@ test("hook: allowUrlPrefixes, expectPayTo and look-alikes are refused before ala
   const pinned = makeClient({ expectPayTo: { "shop.example": "0xBBB" } }, () => ({ decision: "allow" }));
   await assert.rejects(pinned.client.createPaymentPayload(required([good])), /x402-guard pay_to_unexpected: .*0xAAA/);
   assert.equal(pinned.calls.length, 0);
-  const seen = makeClient({}, () => ({ decision: "allow" }));
+  const seen = makeClient({}, (a) => (a.payTo === LOOK ? { decision: "hold", reasons: ["unknown_service"] } : { decision: "allow" }));
   await seen.client.createPaymentPayload(required([{ ...good, payTo: PAYEE }], "https://a.example/x"));
-  await assert.rejects(seen.client.createPaymentPayload(required([{ ...good, payTo: LOOK }], "https://b.example/x")), new RegExp(`x402-guard pay_to_lookalike: .*${PAYEE}`));
-  assert.equal(seen.calls.length, 1);
+  await assert.rejects(seen.client.createPaymentPayload(required([{ ...good, payTo: LOOK }], "https://a.example/y")), new RegExp(`x402-guard pay_to_lookalike: .*${PAYEE}`));
+  await seen.client.createPaymentPayload(required([{ ...good, payTo: LOOK }], "https://b.example/x")); // another host
+  assert.equal(seen.calls.length, 3);
 });
 
 test("hook: userAgent goes in front of the guard's own", async () => {
   const { client, calls } = makeClient({ userAgent: "alalanet-review/1" }, () => ({ decision: "allow" }));
   await client.createPaymentPayload(required([good]));
-  assert.equal(calls[0].ua, "alalanet-review/1 x402-guard/1.5 (hook)");
+  assert.equal(calls[0].ua, "alalanet-review/1 x402-guard/2.0 (hook)");
 });
 
 test("the default new-seller cap is $0.25 a day; payments to known sellers do not use it", async () => {
@@ -610,4 +612,74 @@ test("paid MCP tools: one open payment per tool, not per server URL", async () =
   await assert.rejects(client.createPaymentPayload(required([good], "mcp://tool/weather")), /already_paid: .*mcp:\/\/tool\/weather/);
   assert.deepEqual(calls.map((c) => c.body.url), ["https://tools.example/mcp", "https://tools.example/mcp"]);
   assert.equal(signed.length, 2);
+});
+
+// --- 2.0 round 2: review-1116 guard15 probes, adopted --------------------------------------------
+
+const NEWHOLD = () => ({ decision: "hold", reasons: ["unknown_service", "testnet"] });
+
+test("Q1d with allowHosts or allowUrlPrefixes, a new-seller hold on a URL the 402 names is not paid", async () => {
+  const at = (u) => required([{ ...good, payTo: "0xEVIL" }], u);
+  for (const scope of [{ allowHosts: ["api.trusted.example"] }, { allowUrlPrefixes: ["https://api.trusted.example/"] }]) {
+    const h = makeClient(scope, NEWHOLD);
+    await assert.rejects(h.client.createPaymentPayload(at("https://api.trusted.example/anything")), /x402-guard held: .*names the URL/);
+    assert.deepEqual(h.signed, []);
+    const known = makeClient(scope, () => ({ decision: "allow" }));
+    await known.client.createPaymentPayload(at("https://api.trusted.example/anything"));
+    assert.deepEqual(known.signed, ["0xEVIL"]);
+  }
+  const pinned = makeClient({ allowHosts: ["api.trusted.example"], expectPayTo: { "api.trusted.example": "0xEVIL" } }, NEWHOLD);
+  await pinned.client.createPaymentPayload(at("https://api.trusted.example/anything"));
+  const chosen = makeClient({ allowHosts: ["api.trusted.example"], resourceUrl: () => "https://api.trusted.example/mcp" }, NEWHOLD);
+  await chosen.client.createPaymentPayload(at("mcp://tool/x"));
+  const open = makeClient({}, NEWHOLD);
+  await open.client.createPaymentPayload(at("https://api.trusted.example/anything"));
+  assert.equal(pinned.signed.length + chosen.signed.length + open.signed.length, 3);
+});
+
+test("Q2a documented: a seller naming another resource each time is paid each time", async () => {
+  const { client, signed } = makeClient({}, () => ({ decision: "allow" }));
+  for (let i = 0; i < 3; i++) await client.createPaymentPayload(required([good], `https://shop.example/paid?n=${i}`));
+  assert.equal(signed.length, 3);
+});
+
+test("Q2b a new payee alalanet allows (listed) is paid after another seller named its resource; an unlisted one waits", async () => {
+  let listed = false;
+  const { client, signed, calls } = makeClient({}, (a) => (a.payTo === "0xAAA" && listed ? { decision: "allow" } : { decision: "hold", reasons: ["unknown_service"] }));
+  await client.createPaymentPayload(required([{ ...good, payTo: "0xEVIL" }], "https://honest.example/data"));
+  await assert.rejects(client.createPaymentPayload(required([good], "https://honest.example/data")), /pay_to_changed/);
+  listed = true;
+  await client.createPaymentPayload(required([good], "https://honest.example/data"));
+  assert.deepEqual(signed, ["0xEVIL", "0xAAA"]);
+  assert.equal(calls.length, 3);
+});
+
+test("Q-extra a cheaper option in another asset is no reason to refuse", async () => {
+  const USDT = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
+  const { client, made } = makeClient({}, () => ({ decision: "allow" }));
+  await client.createPaymentPayload(required([{ ...good, amount: "500000" }, { ...good, asset: USDT, amount: "400000" }]));
+  assert.deepEqual(made.map((r) => r.asset), [USDC]);
+});
+
+test("a resourceUrl function decides the URL: a new seller under allowHosts is paid when your code named the URL", async () => {
+  const h = makeClient({ allowHosts: ["api.trusted.example"], resourceUrl: (ctx) => ctx.paymentRequired.resource.url }, NEWHOLD);
+  await h.client.createPaymentPayload(required([good], "https://api.trusted.example/x"));
+  assert.deepEqual(h.signed, ["0xAAA"]);
+});
+
+test("hook: a payee alalanet allows is paid though it looks like one paid on that host", async () => {
+  const PAYEE = "0x1234" + "5".repeat(32) + "abcd";
+  const LOOK = "0x1234" + "d3ad".repeat(8) + "abcd";
+  const { client, signed } = makeClient({}, () => ({ decision: "allow" }));
+  await client.createPaymentPayload(required([{ ...good, payTo: PAYEE }], "https://a.example/x"));
+  await client.createPaymentPayload(required([{ ...good, payTo: LOOK }], "https://a.example/y"));
+  assert.deepEqual(signed, [PAYEE, LOOK]);
+});
+
+test("hook: quote_expired and price_differs_from_description are not paid under the default", async () => {
+  const expired = makeClient({}, () => ({ decision: "block", reasons: ["quote_expired", "unknown_service"] }));
+  await assert.rejects(expired.client.createPaymentPayload(required([good])), /x402-guard blocked: .*quote_expired/);
+  const described = makeClient({}, () => ({ decision: "hold", reasons: ["unknown_service", "price_differs_from_description"] }));
+  await assert.rejects(described.client.createPaymentPayload(required([good])), /x402-guard held: .*price_differs_from_description/);
+  assert.deepEqual([...expired.signed, ...described.signed], []);
 });
