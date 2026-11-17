@@ -679,7 +679,7 @@ test("hook: a payee alalanet allows is paid though it looks like one paid on tha
   assert.deepEqual(signed, [PAYEE, LOOK]);
 });
 
-test("hook: quote_expired and price_differs_from_description are not paid under the default", async () => {
+test("hook: quote_expired, and a reason alalanet dropped (price_differs_from_description, now unknown), are not paid under the default", async () => {
   const expired = makeClient({}, () => ({ decision: "block", reasons: ["quote_expired", "unknown_service"] }));
   await assert.rejects(expired.client.createPaymentPayload(required([good])), /x402-guard blocked: .*quote_expired/);
   const described = makeClient({}, () => ({ decision: "hold", reasons: ["unknown_service", "price_differs_from_description"] }));

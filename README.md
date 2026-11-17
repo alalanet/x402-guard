@@ -121,10 +121,9 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
    - **block**: the payTo is unknown, on the OFAC list or frozen by the stablecoin issuer, the service
      is not working, the quote in the 402 has expired (`quote_expired`), or the price is over your budget;
    - **hold**: the payTo differs from the listing or was never seen, the price is above the listing or
-     what alalanet observed or differs from the price the 402's own description gives
-     (`price_differs_from_description`), the network or asset is not listed, the price is $5 or more,
-     the trust score is low, or the service is unknown or not checked yet. What the guard does with a hold is `onHold`,
-     see [New sellers](#new-sellers);
+     what alalanet observed, the network or asset is not listed, the price is $5 or more, the trust
+     score is low, or the service is unknown or not checked yet. What the guard does with a hold is
+     `onHold`, see [New sellers](#new-sellers);
    - **allow**: otherwise.
 
    The decision is signed and written to a public log. It records the endpoint, the terms and the
@@ -157,8 +156,8 @@ reasons such as `testnet`) is paid, up to **$0.05 a payment and $0.25 a rolling 
 payments together (`newSeller: { maxUsdPerCall, maxUsdPerDay }`). The caps are kept in memory per
 guard object: a new process, or a guard made per task, starts again at $0.25. Make one guard per
 agent and keep it. A hold that compares the payment against data (`price_above_listing`,
-`price_differs_from_description`, `pay_to_differs_from_listing`, `asset_not_stablecoin`,
-`network_not_listed`, `high_price`, `low_trust_score`, ...) or a reason the guard does not know is
+`pay_to_differs_from_listing`, `asset_not_stablecoin`, `network_not_listed`, `high_price`,
+`low_trust_score`, ...) or a reason the guard does not know is
 still refused, and a block (`quote_expired`, `over_budget`, ...) is never paid. In the hook, a new
 seller is not paid while `allowHosts` or `allowUrlPrefixes` is set and the 402 names the URL (see
 above). Before 2.0 the default was `"block"`: no purchase from any seller alalanet has not seen.

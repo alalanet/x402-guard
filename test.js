@@ -682,7 +682,7 @@ test("an expectPayTo prefix applies to every URL that starts with it, ';' paths 
   await assert.rejects(g("https://market.example/s/abc/..;/x"), (e) => e.code === "pay_to_unexpected");
 });
 
-test("preflight's quote_expired (block) and price_differs_from_description (hold) are never paid as new", async () => {
+test("preflight's quote_expired (block) is never paid; a reason alalanet dropped (price_differs_from_description) is refused as unknown", async () => {
   const expired = alalanet(() => ({ decision: "block", reasons: ["quote_expired", "unknown_service", "testnet"] }));
   for (const onHold of [undefined, "allow"]) {
     await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: expired.f, onHold })(URL1), (e) => e.code === "blocked" && e.reasons.includes("quote_expired"));
