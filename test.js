@@ -745,3 +745,108 @@ test("R2-F an expectPayTo pin on a slash-less prefix also covers a sibling (safe
   const g = guardFetch(sellerOf(() => [{ ...good, payTo: "0xDDD" }]), { fetch: alalanet(() => ({ decision: "allow" })).f, expectPayTo: { "https://market.example/s/abc": "0xAAA" } });
   await assert.rejects(g("https://market.example/s/abcd/x"), (e) => e.code === "pay_to_unexpected");
 });
+
+// --- 2.0 P3-F (review-1116 guard15 r3) -----------------------------------------------------------
+
+test("R3-A failOpen: once 1,000 URLs wait, a failOpen pass is refused like any 402; no URL's approval is evicted", async () => {
+  let down = false;
+  const a = alalanet(() => ({ decision: "allow" }));
+  const api = (url, init) => (down ? Promise.reject(new Error("ECONNREFUSED")) : a.f(url, init));
+  const g = guardFetch(sellerOf(() => [good]), { fetch: api, failOpen: true });
+  await g("https://honest.example/x");
+  for (let i = 0; i < 999; i++) await g(`https://other.example/${i}`);
+  down = true;
+  await assert.rejects(g("https://bait.example/x"), (e) => e.code === "over_budget" && /1000 URLs/.test(e.message));
+  down = false;
+  assert.equal((await g("https://honest.example/x", { headers: { "PAYMENT-SIGNATURE": evmPay("0x1", in60()) } })).status, 200);
+});
+
+test("after a definite refusal the approval goes back: a re-signed payment is sent and counted, within the budget", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  let answers = ["refuse", "ok"];
+  const sent = [];
+  const inner = async (req) => {
+    if (!req.headers.has("PAYMENT-SIGNATURE")) return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+    sent.push(req.headers.get("PAYMENT-SIGNATURE"));
+    return answers.shift() === "refuse"
+      ? new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "invalid_exact_evm_payload_authorization_valid_before", transaction: "" }) } })
+      : new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx" }) } });
+  };
+  const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f, maxUsdPerDay: 0.003 });
+  await g(URL1);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x1", in60()) } })).status, 402);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x2", in60()) } })).status, 200, "the re-sign goes out, no new 402");
+  assert.equal(sent.length, 2);
+  await assert.rejects(g("https://shop.example/two"), (e) => e.code === "over_budget"); // 0.002 of 0.003 counted
+  // a re-sign is checked against the budgets again, and the approval still lapses after 20 minutes
+  answers = ["refuse"];
+  const h = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f, maxUsdPerDay: 0.002 });
+  await h(URL1);
+  await h(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x3", in60()) } });
+  await h("https://shop.example/b");
+  await h("https://shop.example/b", { headers: { "PAYMENT-SIGNATURE": evmPay("0x4", in60()) } });
+  await assert.rejects(h(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x5", in60()) } }), (e) => e.code === "over_budget");
+  answers = ["refuse"];
+  const k = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
+  await k(URL1);
+  await k(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x6", in60()) } });
+  t.mock.timers.tick(20 * 60 * 1000 + 1);
+  await assert.rejects(k(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x7", in60()) } }), (e) => e.code === "not_approved");
+});
+
+test("the approval put back after a definite refusal is first in line and keeps its time", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  let price = "2000";
+  let refuse = true;
+  const inner = async (req) => {
+    if (!req.headers.has("PAYMENT-SIGNATURE")) return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [{ ...good, amount: price }] }) } });
+    if (refuse) { refuse = false; return new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) } }); }
+    return new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx" }) } });
+  };
+  const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f, maxUsdPerDay: 0.005 });
+  await g(URL1); // A: $0.002
+  price = "3000";
+  await g(URL1); // B: $0.003, waiting behind A
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x1", in60()) } }); // A refused for sure: A goes back first
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x2", in60()) } }); // takes A again: $0.002 counted, B still holds $0.003
+  price = "2000";
+  await assert.rejects(g("https://shop.example/c"), (e) => e.code === "over_budget");
+  // the put-back approval lapses 20 minutes after its 402, not after the refusal
+  refuse = true;
+  const h = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
+  await h(URL1);
+  t.mock.timers.tick(19 * 60 * 1000);
+  await h(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x3", in60()) } });
+  t.mock.timers.tick(2 * 60 * 1000);
+  await assert.rejects(h(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x4", in60()) } }), (e) => e.code === "not_approved");
+});
+
+test("an approval is not put back when 1,000 other URLs filled the queue meanwhile", async () => {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const inner = async (req) => {
+    if (!req.headers.has("PAYMENT-SIGNATURE")) return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [{ ...good, amount: "100" }] }) } });
+    await gate;
+    return new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) } });
+  };
+  const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
+  await g(URL1);
+  const paying = g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x1", in60()) } });
+  await new Promise((r) => setImmediate(r));
+  for (let i = 0; i < 1000; i++) await g(`https://other.example/${i}`);
+  release();
+  await paying;
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x2", in60()) } }), (e) => e.code === "not_approved");
+});
+
+test("after a definite refusal of a re-presented payment, the unused approval of the new 402 goes back too", async () => {
+  const s = flaky(["timeout", "reject", "ok"]);
+  const g = guardFetch(s.inner, { fetch: statusAndAllow({}).f, maxUsdPerDay: 0.004 });
+  const vb = in60();
+  await g(URL1);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", vb) } }));
+  await g(URL1);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", vb) } })).status, 402); // 0x01 again, refused for sure
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x03", vb) } })).status, 200, "a re-sign uses the approval put back");
+  assert.deepEqual(s.paid.map((p) => unb64(p).payload.authorization.nonce), ["0x01", "0x01", "0x03"]);
+});

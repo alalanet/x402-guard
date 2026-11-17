@@ -476,9 +476,26 @@ export function guardFetch(inner, opts = {}) {
     return { request, held: holds.get(key), created: false };
   }
 
+  // The queue an approval for this URL joins. At most 100 per URL and MEMORY URLs wait (each up to
+  // APPROVAL_MS); past that the 402 is refused, never another URL's approval evicted: its payment
+  // would then be refused as not approved.
+  function roomFor(url, verdict) {
+    const now = Date.now();
+    for (const [u, q] of pending) {
+      while (q.length && now - q[0].at > APPROVAL_MS) q.shift();
+      if (!q.length) pending.delete(u);
+    }
+    const queue = pending.get(url) || [];
+    if (queue.length >= 100 || (!queue.length && pending.size >= MEMORY)) {
+      throw new X402GuardError("over_budget", `x402-guard: too many 402s are waiting for their payment (${queue.length ? `100 for ${url}` : `${MEMORY} URLs`}); not paying ${url}`, { url, verdict });
+    }
+    pending.set(url, queue);
+    return queue;
+  }
+
   // The oldest reservation for this URL, bound to the payment that is going out: counted from now
-  // on, until a definite failure. One that expired (the payer took more than RESERVE_MS) stopped
-  // counting, so the budgets must have room for it again, or nothing is sent.
+  // on, until a definite failure. One that no longer counts (the payer took more than RESERVE_MS, or
+  // it came back after a definite refusal) needs room in the budgets again, or nothing is sent.
   function takeReservation(url) {
     const queue = pending.get(url) || [];
     let r = queue.shift();
@@ -493,7 +510,7 @@ export function guardFetch(inner, opts = {}) {
     if (until <= Date.now()) {
       const b = budgetLeft(opts, rules.spent, host);
       const room = !b.over && (b.maxUsd === undefined || usd <= b.maxUsd + 1e-9) && (!fresh || usd <= rules.newLeft() + 1e-9);
-      if (!room) throw new X402GuardError("over_budget", "x402-guard: this payment came more than 5 minutes after its 402 and your budget has no room for it now; not sending it", { url });
+      if (!room) throw new X402GuardError("over_budget", "x402-guard: this payment's approval no longer holds a share of your budget, and the budget has no room for it now; not sending it", { url });
     }
     r.entry = rules.add({ at: Date.now(), usd, host, fresh });
     return r;
@@ -563,6 +580,16 @@ export function guardFetch(inner, opts = {}) {
       const definite = definiteFailure(response, settle, required);
       if (key !== undefined && holds.has(key) && ((response.ok && settle.success !== false) || definite)) holds.delete(key);
       if (definite && sent) rules.drop(sent);
+      if (definite && reserved) {
+        // nothing was taken: the approval goes back first in line, holding no share until it is used,
+        // so a payment the client signs again (a recovery) is judged and counted, not refused
+        const e = reserved.entry;
+        const queue = pending.get(url) || [];
+        if (queue.length < 100 && (queue.length || pending.size < MEMORY)) {
+          queue.unshift({ at: reserved.at, entry: e && { at: Date.now(), usd: e.usd, host: e.host, fresh: e.fresh, until: 0 }, allowed: reserved.allowed });
+          pending.set(url, queue);
+        }
+      }
       const approved = reserved?.allowed || [];
       const usd = approved.length ? Math.max(...approved.map((o) => o.usd || 0)) : 0;
       const paid = settle.success === true || (settle.success !== false && response.ok);
@@ -599,7 +626,7 @@ export function guardFetch(inner, opts = {}) {
       verdict = await preflight(url, header || text, budget.maxUsd);
     } catch (e) {
       if (opts.failOpen) {
-        bounded(pending, url, pending.get(url) || []).push({ at: Date.now(), entry: null, allowed: [] });
+        roomFor(url).push({ at: Date.now(), entry: null, allowed: [] }); // a pass: not checked, not counted
         return new Response(text, { status: 402, headers: response.headers });
       }
       throw new X402GuardError("alalanet_unreachable", `x402-guard: could not get a decision (${e.message}); not paying`, { url });
@@ -645,18 +672,10 @@ export function guardFetch(inner, opts = {}) {
     // Reserve the dearest option handed over until its payment comes (or RESERVE_MS passes). An
     // approval waits APPROVAL_MS for its payment; at most 100 per URL and MEMORY URLs wait, and past
     // that the 402 is refused: a dropped one would leave its payment unapproved.
+    const queue = roomFor(url, verdict);
     const at = Date.now();
-    for (const [u, q] of pending) {
-      while (q.length && at - q[0].at > APPROVAL_MS) q.shift();
-      if (!q.length) pending.delete(u);
-    }
-    const queue = pending.get(url) || [];
-    if (queue.length >= 100 || (!queue.length && pending.size >= MEMORY)) {
-      throw new X402GuardError("over_budget", `x402-guard: too many 402s are waiting for their payment (${queue.length ? `100 for ${url}` : `${MEMORY} URLs`}); not paying ${url}`, { url, verdict });
-    }
     const entry = rules.add({ at, usd: Math.max(...allowed.map((o) => o.usd || 0)), host, fresh: allowed.some((o) => judged.get(o).fresh), until: at + RESERVE_MS });
     queue.push({ at, entry, allowed });
-    pending.set(url, queue);
 
     // Hand the payer only the allowed options, in the order of `allowed` (cheapest first).
     const rank = (a) => allowed.findIndex((o) => optionMatches(a, [o]) && (o.network_id === undefined || same(o.network_id, a.network)));
