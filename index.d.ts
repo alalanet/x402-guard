@@ -10,7 +10,7 @@ export type PreflightReason =
   // hold: the seller is new to alalanet
   | "unknown_service" | "not_checked_yet" | "not_rated_yet" | "pay_to_never_seen"
   // hold: compared against data
-  | "pay_to_differs_from_listing" | "price_above_listing" | "price_above_observed"
+  | "pay_to_differs_from_listing" | "listing_removed" | "price_above_listing" | "price_above_observed"
   | "network_not_listed" | "asset_not_stablecoin" | "price_not_comparable_to_budget" | "high_price" | "low_trust_score"
   // info
   | "pay_to_as_observed" | "pay_to_platform_wallet" | "amount_is_ceiling" | "frozen_status_unknown" | "testnet";

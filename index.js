@@ -226,8 +226,9 @@ const APPROVAL_MS = RESERVE_MS + 15 * 60 * 1000; // wrapper: how long an approve
 const PAY_TO_CHANGED_MS = 15 * 60 * 1000; // hook: how long a resource just paid may not ask for another payee
 
 // alalanet's hold reasons that only say it has no data on the seller yet. Every other hold reason
-// compares the payment against data (a listing, earlier 402s, the trust score, the asset), and so
-// does any reason the guard does not know; none of those is paid as new. Blocks (quote_expired, over_budget, ...) are never paid.
+// compares the payment against data (a listing or its removal: listing_removed, earlier 402s, the
+// trust score, the asset), and so does any reason the guard does not know; none of those is paid as
+// new. Blocks (quote_expired, over_budget, ...) are never paid.
 const NEW_SELLER = new Set(["unknown_service", "not_checked_yet", "not_rated_yet", "pay_to_never_seen"]);
 // reasons alalanet gives as information only
 const INFO = new Set(["testnet", "frozen_status_unknown", "pay_to_as_observed", "pay_to_platform_wallet", "amount_is_ceiling"]);
