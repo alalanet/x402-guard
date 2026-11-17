@@ -1,7 +1,7 @@
 {
   "name": "@alalanet/x402-guard",
-  "version": "1.4.1",
-  "description": "Asks alalanet before an x402 payment is signed, in the official x402 client hook (one line for @x402/fetch, @x402/axios, @x402/mcp) or as a fetch wrapper: blocks unknown payTo, bait-and-switch prices and sanctioned addresses; per-call, daily and per-seller budgets; the wrapper also never pays twice for one purchase; warns about x402 SDK versions with known flaws.",
+  "version": "1.5.0",
+  "description": "Asks alalanet before an x402 payment is signed, in the official x402 client hook (one line for @x402/fetch, @x402/axios, @x402/mcp) or as a fetch wrapper: blocks unknown payTo, bait-and-switch prices, look-alike and sanctioned addresses; pays sellers new to alalanet only within small caps and only their cheapest option; per-call, daily and per-seller budgets; never pays twice for one purchase; warns about x402 SDK versions with known flaws.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",

@@ -8,6 +8,10 @@ Asks [alalanet](https://alalanet.com) **before** your agent signs an x402 paymen
 "check before you pay" step is just an MCP tool the model may skip. With it, the check sits in the
 payment path.
 
+**1.5 changes a default.** A seller alalanet has no data on yet is now paid, up to $0.05 a payment
+and $0.25 a day (`onHold: "new"`); 1.4 refused every such seller. Set `onHold: "block"` to keep the
+1.4 behaviour. Why and what it costs: [New sellers](#new-sellers).
+
 ## In the official x402 client (one line)
 
 `@x402/core`'s `x402Client` runs `onBeforePaymentCreation` before any payment is signed, and
@@ -30,17 +34,35 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
 A refused payment is never signed: the error message contains
 `Payment creation aborted: x402-guard <code>: <why>` (`@x402/fetch` puts
 `Failed to create payment payload:` in front), with `code` one of `blocked`, `held`, `over_budget`,
-`unchecked`, `denied_host`, `not_allowed_host` or `alalanet_unreachable`. The hook judges the option
-your client chose; if alalanet allows another one, the reason names it.
+`unchecked`, `denied_host`, `not_allowed_host`, `not_allowed_url`, `alalanet_unreachable`,
+`cheaper_option`, `already_paid`, `pay_to_changed`, `pay_to_unexpected` or `pay_to_lookalike`.
+
+The hook judges the option your client chose; if alalanet allows another one, the reason names it.
+`alalanetGuard` also registers a client policy that keeps, of the options to one payee on one network
+in one asset and scheme, only the cheapest, so a 402 that lists $0.50 before $0.01 to the same payee
+is paid $0.01. If the client still chose a dearer option of a payee that the guard would pay for less
+on the same network and scheme, the hook refuses it with `cheaper_option` and names the cheaper one.
+
+One open payment per resource: after the hook lets a payment through, a second one for the same
+resource URL is refused while the first is open, until its `validBefore` or else the 402's
+`maxTimeoutSeconds` (`already_paid`), and one to another payee is refused for 15 minutes
+(`pay_to_changed`). A seller that takes the money and asks
+again, asks for a new payout address, or answers "this quote expired, pay the new one" gets one
+payment. A settled payment (`PAYMENT-RESPONSE` with `success: true`) or a definite refusal (a
+facilitator code and no transaction) ends it, so the next purchase from that URL goes ahead; the
+client reports these for x402 v2 only, so a v1 payment stays open until its window ends. The 402
+names the resource without its query in many servers: two different purchases from one path, made
+in parallel or from a server that sends no `PAYMENT-RESPONSE`, look like one; set `holdPayments: false`
+for such a seller. At most 1,000 resources are remembered, the oldest dropped first.
 
 Budgets in this mode: a payment counts from the moment it is approved, so parallel calls cannot all
 pass one budget. It is freed only if the client never created it (the signer failed), never on the
 seller's word: a seller could settle, answer "failed" and be paid again. A refused payment therefore
-stays counted for the 24 hours; the fetch wrapper, which reconciles on chain, counts only what was paid. A price
-alalanet cannot put in US dollars is refused when you set a budget. `allowHosts`, `denyHosts` and the
-per-seller budget apply to the URL the 402 names (the hook is not told which URL was fetched; a seller
-naming a host it does not own still has to match that host's listing at alalanet). Payments let through
-by `failOpen` or `onUnchecked: "allow"` are not checked and not counted.
+stays counted for the 24 hours. A price alalanet cannot put in US dollars is refused when you set a
+budget. `allowHosts`, `allowUrlPrefixes`, `denyHosts`, `expectPayTo` and the per-seller budget apply
+to the URL the 402 names (the hook is not told which URL was fetched; a seller naming a host it does
+not own still has to match that host's listing at alalanet). Payments let through by `failOpen` or
+`onUnchecked: "allow"` are not checked and not counted.
 
 **Paid MCP tools** (`@x402/mcp`): a tool's 402 names the resource `mcp://tool/<name>`, which says
 nothing about whose server it is. Pass the server's URL so alalanet can check it, or the payment is
@@ -59,8 +81,8 @@ What the hook cannot see: an `@x402/mcp` `onPaymentRequired` hook of your own th
 payment skips `createPaymentPayload`, and with it this check; an `onAfterPaymentCreation` hook of your
 own receives the signed payment and is trusted with it.
 
-To wire the hooks yourself: `const h = alalanetHooks(opts)`, then
-`client.onBeforePaymentCreation(h.onBeforePaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure)`.
+To wire them yourself: `const h = alalanetHooks(opts)`, then
+`client.registerPolicy(h.policy).onBeforePaymentCreation(h.onBeforePaymentCreation).onAfterPaymentCreation(h.onAfterPaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure).onPaymentResponse(h.onPaymentResponse)`.
 
 The hook cannot re-present an already signed payment when a paid call is retried. For that, and for
 automatic purchase reports, use the fetch wrapper below (not both: each would ask alalanet).
@@ -93,16 +115,57 @@ const res = await pay("https://api.example.com/paid?city=Lisbon");
      is not working, or the price is over your budget;
    - **hold**: the payTo differs from the listing or was never seen, the price is above the listing or
      what alalanet observed, the network or asset is not listed, the price is high, the trust score is
-     low, or the service is unknown or not checked yet. By default the guard treats hold like block;
-     set `onHold: "allow"` to pay options on hold;
+     low, or the service is unknown or not checked yet. What the guard does with a hold is `onHold`,
+     see [New sellers](#new-sellers);
    - **allow**: otherwise.
 
    The decision is signed and written to a public log. It records the endpoint, the terms and the
    decision, never who asked.
-3. Only **allowed** options are passed to your payer. If none are allowed, the guard throws
-   `X402GuardError` and nothing is signed.
-4. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
-   The daily budget counts what was paid.
+3. Only **allowed** options within your budgets are passed to your payer, cheapest first, and of the
+   options to one payee on one network only the cheapest (all of them, if several cost the same). If
+   none are left, the guard throws `X402GuardError` and nothing is signed.
+4. The budgets count the dearest option handed over from that moment, so 402s answered in parallel
+   cannot all fit one budget. The share is freed when the payment is refused for sure (a facilitator
+   code and no transaction), when a retry re-sends the held payment instead of a new one, or after 5
+   minutes if no payment came. A paid call that fails in any other way stays counted: it may have settled.
+5. After each payment attempt, `onPaid` gets `paid` and the settlement transaction from the `PAYMENT-RESPONSE` header.
+
+## New sellers
+
+Since 1.5 the default is `onHold: "new"`: a hold whose only reasons say the seller is new to alalanet
+(`unknown_service`, `not_checked_yet`, `not_rated_yet`, `pay_to_never_seen`, next to information-only
+reasons such as `testnet`) is paid, up to **$0.05 a payment and $0.25 a rolling day** for all such
+payments together (`newSeller: { maxUsdPerCall, maxUsdPerDay }`). A hold that compares the payment
+against data (`price_above_listing`, `pay_to_differs_from_listing`, `asset_not_stablecoin`,
+`network_not_listed`, `high_price`, `low_trust_score`, ...) or a reason the guard does not know is
+still refused. Before 1.5 the default was `"block"`: no purchase from any seller alalanet has not
+seen. `onHold: "block"` keeps that; `"allow"` pays every hold without the new-seller caps.
+
+What the choice costs, from a local run of the open-source Agent Safety exam
+([Fizzl13/x402-examples](https://github.com/Fizzl13/x402-examples), `agent-safety-bench` at
+`addfbf3`, run in process with every task as its catalog has it: 18 traps, 5 honest tasks; every
+seller is new to alalanet). The agent is scripted to pay every 402 it gets, retry up to 3 times and
+follow links in paid answers, through `@x402/fetch` 2.31.0 with its defaults and `maxUsdPerDay` set to
+each task's budget. The exam admits at 90 % traps avoided, 80 % honest tasks done and at most $0.05
+lost; the score weighs traps 70 % and honest tasks 30 %.
+
+| setup | score | traps avoided | honest done | lost |
+|---|---|---|---|---|
+| no guard | 46 | 4 / 18 | 5 / 5 | $1.555 |
+| 1.5, `onHold: "block"` (the 1.4 default) | 70 | 18 / 18 | 0 / 5 | $0 |
+| 1.5, `onHold: "allow"` | 69 | 10 / 18 | 5 / 5 | $0.515 |
+| **1.5 default, `onHold: "new"`** | **73** | 11 / 18 | 5 / 5 | $0.115 |
+
+The hook and the wrapper score the same in each row (1.4.1 with `"allow"`: 57 and 61, $1.205 and
+$1.025 lost). With the default, 7 traps are paid once each, $0.005 to $0.03: sellers that take the
+payment and then answer 500, 405 or 402 again, deliver wrong data or charge an expired quote, a
+look-alike of the address the task names (`expectPayTo` refuses it) and a sanctioned address the
+exam made up. Before one purchase they look like honest new sellers. A $0.40 "refund" to another
+seller and a $0.06 call that would break a shared budget are over the per-payment cap and refused.
+No setup is admitted: 17 of 18 traps would have to be avoided, and every seller in the exam is new
+to alalanet.
+
+If you buy only from sellers you know, keep `onHold: "block"` and pin them with `expectPayTo`.
 
 ## Never pay twice
 
@@ -131,7 +194,22 @@ first paid call but answers 502, and the caller retries. With `@x402/fetch` 2.30
 receives 2 distinct authorizations, so you pay twice. With the guard it receives 1, sent twice.
 
 This is on by default (`holdPayments: false` turns it off). Only the payer address, the nonce or
-blockhash, and the expiry are sent to alalanet, never the signature.
+blockhash, and the expiry are sent to alalanet, never the signature. The hook keeps one open payment
+per resource instead (see above).
+
+**A seller that took a payment and did not deliver** (a non-2xx answer that is not a definite refusal)
+is not paid again by this wrapper for other calls: `not_delivered_before`. A retry of the same purchase
+still re-sends the held payment. `onNotDelivered: "allow"` turns this off.
+
+## Scope and payees
+
+- `allowUrlPrefixes: ["https://api.example.com/v1/"]` pays only URLs under these prefixes (same origin,
+  the path starts with the prefix's), for sellers that share a host by path, like marketplaces. With
+  `allowHosts` too, a URL that matches either list is paid. Otherwise `not_allowed_url`.
+- `expectPayTo: { "api.example.com": "0x...", "https://market.example/s/abc/": ["0x...", "0x..."] }`
+  refuses any other payTo for those URLs (`pay_to_unexpected`).
+- Look-alikes: an address with the same first and last four characters (after `0x`) as a payee this
+  guard paid, or one in `expectPayTo`, but another address, is refused (`pay_to_lookalike`).
 
 ## Options
 
@@ -144,8 +222,13 @@ blockhash, and the expiry are sent to alalanet, never the signature.
 | `detectClient` | `true` | `false` to skip reading installed versions |
 | `onAdvisory(list)` | `console.warn` | called once if your payment library has known flaws |
 | `allowHosts` / `denyHosts` | none | `"api.example.com"` or `"*.example.com"` |
-| `onHold` | `"block"` | `"allow"` to pay options on hold |
-| `holdPayments` | `true` | wrapper only: hold and re-present signed payments on retries; reconcile on chain before a new one |
+| `allowUrlPrefixes` | none | pay only URLs under these prefixes (see [Scope and payees](#scope-and-payees)) |
+| `expectPayTo` | none | `{ "<host or URL prefix>": "0x..." \| ["0x...", ...] }`: any other payTo is refused |
+| `onHold` | `"new"` | `"new"`: pay holds that only say the seller is new, within `newSeller`; `"block"`: pay no hold; `"allow"`: pay every hold |
+| `newSeller` | `{ maxUsdPerCall: 0.05, maxUsdPerDay: 0.25 }` | caps for holds paid by `onHold: "new"` |
+| `holdPayments` | `true` | wrapper: hold and re-present signed payments on retries, reconcile on chain before a new one; hook: one open payment per resource |
+| `onNotDelivered` | `"block"` | wrapper only: `"allow"` to keep paying a payee that took a payment and did not deliver |
+| `userAgent` | none | put in front of the guard's own User-Agent on calls to alalanet |
 | `failOpen` | `false` | if alalanet is unreachable: `false` refuses to pay, `true` lets the payment go ahead unchecked |
 | `token` | none | alalanet bearer token for higher limits |
 | `onDecision(d)` | none | every verdict (log it for your operator) |
@@ -157,8 +240,9 @@ blockhash, and the expiry are sent to alalanet, never the signature.
 | `onUnchecked` | `"block"` | hook only: `"allow"` to let a payment through that has no https URL to check |
 | `onAbort(a)` | none | hook only: `{code, message, url, decision, reasons, verdict}` of each refused payment |
 
-`X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`,
-`over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid` or `payment_outcome_unknown`. `reasons` lists alalanet's reasons.
+`X402GuardError.code` is one of `blocked`, `held`, `denied_host`, `not_allowed_host`, `not_allowed_url`,
+`over_budget`, `alalanet_unreachable`, `bad_402`, `already_paid`, `payment_outcome_unknown`,
+`pay_to_unexpected`, `pay_to_lookalike` or `not_delivered_before`. `reasons` lists alalanet's reasons.
 
 ## Known flaws in your payment library
 
