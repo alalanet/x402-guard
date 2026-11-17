@@ -71,10 +71,28 @@ export interface GuardOptions {
   onAdvisory?(advisories: Advisory[]): void;
   /** never pay these hosts ("api.example.com" or "*.example.com") */
   denyHosts?: string[];
-  /** if set, pay only these hosts */
+  /** if set, pay only these hosts (with allowUrlPrefixes: a URL matching either list is paid) */
   allowHosts?: string[];
-  /** what to do with "hold" options (default "block") */
-  onHold?: "block" | "allow";
+  /**
+   * if set, pay only URLs that start with one of these ("https://api.example.com/v1/"): same origin, and
+   * the path (with query) starts with the prefix's. Refused otherwise with not_allowed_url.
+   */
+  allowUrlPrefixes?: string[];
+  /**
+   * the payee you expect, per host ("api.example.com", "*.example.com") or URL prefix ("https://..."):
+   * one address or several. Any other payTo for a matching URL is refused (pay_to_unexpected). These
+   * addresses and every payee this guard paid are also compared against look-alikes (same first and
+   * last four characters, another address: pay_to_lookalike).
+   */
+  expectPayTo?: Record<string, string | string[]>;
+  /**
+   * what to do with "hold" options (default "new"): "new" pays a hold whose only reasons say the seller
+   * is new to alalanet (unknown_service, not_checked_yet, not_rated_yet, pay_to_never_seen, besides
+   * information-only reasons), within the newSeller caps; "block" pays no hold; "allow" pays every hold
+   */
+  onHold?: "new" | "block" | "allow";
+  /** caps for holds paid by onHold "new" (default 0.05 USD a payment, 0.25 USD a rolling 24 h) */
+  newSeller?: { maxUsdPerCall?: number; maxUsdPerDay?: number };
   /**
    * if alalanet cannot be reached: refuse to pay (false, default) or let the payment go ahead unchecked
    * (true: the wrapper passes the 402 through, the hook does not abort); such a payment is not counted
@@ -83,6 +101,8 @@ export interface GuardOptions {
   failOpen?: boolean;
   /** fetch used to call alalanet (default: globalThis.fetch) */
   fetch?: typeof fetch;
+  /** put in front of the guard's own User-Agent on calls to alalanet, e.g. "my-agent/2" */
+  userAgent?: string;
   onDecision?(d: Decision): void;
   /**
    * Wrapper only. Report each paid call to alalanet (POST /v1/purchases, verified on chain; no key needed).
@@ -94,11 +114,19 @@ export interface GuardOptions {
   /** wrapper only: called after every payment attempt (check `paid`); use it to report the outcome (alalanet report_purchase) */
   onPaid?(p: Paid): void | Promise<void>;
   /**
-   * Wrapper only. Double-pay protection (default true): hold the signed payment per purchase (method + URL + body)
-   * and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read on
-   * chain) before a new payment may be signed. Set false to disable.
+   * Double-pay protection (default true). Wrapper: hold the signed payment per purchase (method + URL +
+   * body) and re-present it on a retry while it is valid; after that, ask alalanet (payment_status, read
+   * on chain) before a new payment may be signed. Hook: per resource URL, refuse a second payment while
+   * the first is open (already_paid) and one to another payee for 15 minutes (pay_to_changed); a settled
+   * payment or a definite refusal ends that. Set false to disable.
    */
   holdPayments?: boolean;
+  /**
+   * Wrapper only. A payee that took a payment and answered without delivering (a non-2xx answer that is
+   * not a definite refusal): "block" (default) refuses new payments to it for the guard's lifetime
+   * (not_delivered_before; a retry of the same purchase still re-presents the held payment); "allow" pays it.
+   */
+  onNotDelivered?: "block" | "allow";
   /** called when a retry re-presents the held payment instead of a newly signed one */
   onRepresent?(e: { url: string; info: PaymentInfo }): void;
   /** called with alalanet's payment_status answer when the hold window has closed */
@@ -132,7 +160,9 @@ export declare function paymentInfo(headerValue: string): PaymentInfo | null;
 export declare function solanaPaymentInfo(txBase64: string): { signers: string[]; feePayer: string; blockhash: string };
 
 export declare class X402GuardError extends Error {
-  code: "blocked" | "held" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable" | "bad_402" | "already_paid" | "payment_outcome_unknown";
+  code:
+    | "blocked" | "held" | "denied_host" | "not_allowed_host" | "not_allowed_url" | "over_budget" | "alalanet_unreachable"
+    | "bad_402" | "already_paid" | "payment_outcome_unknown" | "pay_to_unexpected" | "pay_to_lookalike" | "not_delivered_before";
   /** already_paid: the settlement transaction of the earlier payment */
   tx?: string;
   status?: PaymentStatus;
@@ -156,7 +186,9 @@ export interface HookOptions {
   onUnchecked?: "block" | "allow";
   /** called when the hook refuses a payment; the client then throws "Payment creation aborted: x402-guard <code>: …" */
   onAbort?(a: {
-    code: "blocked" | "held" | "unchecked" | "denied_host" | "not_allowed_host" | "over_budget" | "alalanet_unreachable";
+    code:
+      | "blocked" | "held" | "unchecked" | "denied_host" | "not_allowed_host" | "not_allowed_url" | "over_budget"
+      | "alalanet_unreachable" | "cheaper_option" | "already_paid" | "pay_to_changed" | "pay_to_unexpected" | "pay_to_lookalike";
     message: string;
     url: string;
     decision?: string;
@@ -171,23 +203,35 @@ export interface GuardHooks {
    * payment counts against the budgets from this moment
    */
   onBeforePaymentCreation(ctx: { paymentRequired: any; selectedRequirements: any }): Promise<void | { abort: true; reason: string }>;
+  /** for x402Client.onAfterPaymentCreation: records the payee as paid and the payment's validBefore */
+  onAfterPaymentCreation(ctx: { paymentRequired: any; selectedRequirements: any; paymentPayload: any }): Promise<void>;
+  /** for x402Client.onPaymentResponse: a settled payment or a definite refusal ends the resource's open payment */
+  onPaymentResponse(ctx: { paymentPayload: any; requirements: any; settleResponse?: any; paymentRequired?: any }): Promise<void>;
   /** for x402Client.onPaymentCreationFailure: a payment that was never created frees its share of the budgets */
   onPaymentCreationFailure(ctx: { paymentRequired: any; selectedRequirements: any; error: Error }): Promise<void>;
+  /** for x402Client.registerPolicy: of the options to one payee on one network, asset and scheme, only the cheapest */
+  policy(x402Version: number, requirements: any[]): any[];
 }
 
 /**
- * The hooks, to wire them yourself:
+ * The hooks and the policy, to wire them yourself:
  *   const h = alalanetHooks(opts);
- *   client.onBeforePaymentCreation(h.onBeforePaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure);
+ *   client.registerPolicy(h.policy).onBeforePaymentCreation(h.onBeforePaymentCreation)
+ *     .onAfterPaymentCreation(h.onAfterPaymentCreation).onPaymentCreationFailure(h.onPaymentCreationFailure)
+ *     .onPaymentResponse(h.onPaymentResponse);
  */
 export declare function alalanetHooks(opts?: GuardOptions & HookOptions): GuardHooks;
 
 /**
  * Plug alalanet into the official x402 client (@x402/core x402Client): every payment it is about to
  * create is judged first, within your budgets. @x402/fetch, @x402/axios and @x402/mcp create payments
- * through this client, so one line covers them. Returns the client.
+ * through this client, so one line covers them. Registers the policy and the four hooks the client
+ * has. Returns the client.
  */
 export declare function alalanetGuard<C extends {
   onBeforePaymentCreation(hook: GuardHooks["onBeforePaymentCreation"]): unknown;
   onPaymentCreationFailure(hook: GuardHooks["onPaymentCreationFailure"]): unknown;
+  onAfterPaymentCreation?(hook: GuardHooks["onAfterPaymentCreation"]): unknown;
+  onPaymentResponse?(hook: GuardHooks["onPaymentResponse"]): unknown;
+  registerPolicy?(policy: GuardHooks["policy"]): unknown;
 }>(client: C, opts?: GuardOptions & HookOptions): C;

@@ -93,8 +93,12 @@ test("non-402 responses pass untouched and cost nothing", async () => {
   assert.equal(called, 0);
 });
 
-test("refused payment is reported as not paid and costs nothing", async () => {
-  const inner = async (req) => new Response("{}", { status: 402, headers: req.headers.has("PAYMENT-SIGNATURE") ? {} : { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+test("refused payment is reported as not paid; only a definite refusal frees its share of the budget", async () => {
+  let refusal = {}; // the paid call's 402: no reason at all (it may have settled), then a facilitator code
+  const inner = async (req) =>
+    req.headers.has("PAYMENT-SIGNATURE")
+      ? new Response("{}", { status: 402, headers: refusal })
+      : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
   const a = alalanet(() => ({ decision: "allow" }));
   const seen = [];
   const g = guardFetch(inner, { fetch: a.f, maxUsdPerDay: 0.002, onPaid: (p) => seen.push(p) });
@@ -102,7 +106,12 @@ test("refused payment is reported as not paid and costs nothing", async () => {
   await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
   assert.equal(seen[0].paid, false);
   assert.equal(seen[0].usd, 0);
-  await g(URL1); // budget untouched
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget"); // no reason: it stays counted
+  const g2 = guardFetch(inner, { fetch: a.f, maxUsdPerDay: 0.002 });
+  refusal = { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) };
+  await g2(URL1);
+  await g2(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
+  assert.equal((await g2(URL1)).status, 402); // a facilitator's code and no transaction: freed
 });
 
 test("report: true sends the outcome bound to the settlement tx", async () => {
@@ -270,4 +279,248 @@ test("an option without a known USD price is not paid when a budget is set", asy
   await assert.rejects(guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 1 })(URL1), (e) => e.code === "over_budget");
   const r = await guardFetch(server({ accepts: [good] }).inner, { fetch: a.f })(URL1); // no budget
   assert.equal(r.status, 402);
+});
+
+// --- 1.5: new sellers, the cheapest option, reservations, scopes (FIZZL-EXAM-1) ------------------
+
+const NEW_REASONS = ["unknown_service", "not_checked_yet", "not_rated_yet", "pay_to_never_seen"];
+const evmPayTo = (payTo, nonce, validBefore) =>
+  b64({ x402Version: 2, accepted: { ...good, payTo }, payload: { signature: "0xsig" + nonce, authorization: { from: "0xme", to: payTo, nonce, validBefore: String(validBefore) } } });
+const in60 = () => Math.floor(Date.now() / 1000) + 60;
+
+test("a hold that only says the seller is new is paid by default, up to $0.05 a payment", async () => {
+  const a = alalanet(() => ({ decision: "hold", reasons: ["unknown_service", "testnet"] }));
+  const r = await guardFetch(server({ accepts: [good] }).inner, { fetch: a.f })(URL1);
+  assert.equal(r.status, 402);
+  assert.deepEqual(unb64(r.headers.get("PAYMENT-REQUIRED")).accepts.map((x) => x.payTo), ["0xAAA"]);
+  const dear = server({ accepts: [{ ...good, amount: "50001" }] });
+  await assert.rejects(guardFetch(dear.inner, { fetch: a.f })(URL1), (e) => e.code === "held" && /new seller/.test(e.message) && /0\.05/.test(e.message));
+  assert.equal((await guardFetch(server({ accepts: [{ ...good, amount: "50000" }] }).inner, { fetch: a.f })(URL1)).status, 402);
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, onHold: "block" })(URL1), (e) => e.code === "held");
+});
+
+test("only the four 'new' reasons (with info) qualify; a hold that compares against data stays refused", async () => {
+  for (const reason of NEW_REASONS) {
+    const a = alalanet(() => ({ decision: "hold", reasons: [reason, "frozen_status_unknown", "pay_to_platform_wallet", "amount_is_ceiling", "pay_to_as_observed"] }));
+    assert.equal((await guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, onHold: "new" })(URL1)).status, 402, reason);
+  }
+  const data = ["price_above_listing", "price_above_observed", "pay_to_differs_from_listing", "asset_not_stablecoin", "network_not_listed", "high_price", "low_trust_score", "price_not_comparable_to_budget", "a_future_reason"];
+  for (const reason of data) {
+    const a = alalanet(() => ({ decision: "hold", reasons: ["not_checked_yet", reason] }));
+    await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, onHold: "new" })(URL1), (e) => e.code === "held", reason);
+  }
+  for (const reasons of [[], ["testnet"]]) {
+    const a = alalanet(() => ({ decision: "hold", reasons }));
+    await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: a.f })(URL1), (e) => e.code === "held", reasons.join());
+  }
+  const unpriced = alalanet(() => ({ decision: "hold", reasons: ["unknown_service"], usd: undefined }));
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: unpriced.f })(URL1), (e) => e.code === "held");
+  const blocked = alalanet(() => ({ decision: "block", reasons: ["unknown_service"] }));
+  await assert.rejects(guardFetch(server({ accepts: [good] }).inner, { fetch: blocked.f })(URL1), (e) => e.code === "blocked");
+});
+
+test("the new-seller daily cap counts payments to new sellers only", async () => {
+  const s = server({ accepts: [good] });
+  const a = alalanet((o, body) => (body.url.includes("known") ? { decision: "allow" } : { decision: "hold", reasons: ["pay_to_never_seen"] }));
+  const g = guardFetch(s.inner, { fetch: a.f, newSeller: { maxUsdPerDay: 0.003 } });
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } }); // 0.002 to a new seller
+  await assert.rejects(g("https://shop.example/two"), (e) => e.code === "held" && /new seller/.test(e.message) && /0\.003/.test(e.message));
+  assert.equal((await g("https://known.example/paid")).status, 402);
+  const perCall = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, newSeller: { maxUsdPerCall: 0.001 } });
+  await assert.rejects(perCall(URL1), (e) => e.code === "held" && /0\.001/.test(e.message));
+  const exact = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, newSeller: { maxUsdPerCall: 0.002, maxUsdPerDay: 0.002 } });
+  assert.equal((await exact(URL1)).status, 402);
+});
+
+test("onHold allow pays any hold, without the new-seller caps", async () => {
+  const a = alalanet(() => ({ decision: "hold", reasons: ["price_above_listing"] }));
+  const r = await guardFetch(server({ accepts: [{ ...good, amount: "900000" }] }).inner, { fetch: a.f, onHold: "allow" })(URL1);
+  assert.equal(r.status, 402);
+});
+
+test("the payer gets the allowed options cheapest first, one per payee and network", async () => {
+  const dear = { ...good, amount: "500000" };
+  const cheap = { ...good, amount: "10000" };
+  const other = { ...good, amount: "5000", payTo: "0xBBB" };
+  const usdt = { ...good, amount: "10000", asset: "0xdAC17F958D2ee523a2206206994597C13D831ec7" };
+  const mainnet = { ...good, network: "eip155:1", amount: "20000" };
+  const s = server({ accepts: [dear, cheap, mainnet, usdt, other] });
+  const a = alalanet((o) => ({ decision: "allow", network: o.network === "eip155:1" ? "ethereum" : "base", network_id: o.network }));
+  const r = await guardFetch(s.inner, { fetch: a.f })(URL1);
+  const got = unb64(r.headers.get("PAYMENT-REQUIRED")).accepts.map((x) => `${x.payTo} ${x.amount} ${x.network} ${x.asset.slice(0, 6)}`);
+  assert.deepEqual(got, ["0xBBB 5000 eip155:8453 0x8335", "0xAAA 10000 eip155:8453 0x8335", "0xAAA 10000 eip155:8453 0xdAC1", "0xAAA 20000 eip155:1 0x8335"]);
+  assert.deepEqual((await r.json()).accepts.map((x) => `${x.payTo} ${x.amount} ${x.network} ${x.asset.slice(0, 6)}`), got);
+});
+
+test("parallel 402s cannot both fit one budget: the amount is reserved when the payer gets the 402", async () => {
+  const s = server({ accepts: [{ ...good, amount: "60000" }] });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 0.1 });
+  const results = await Promise.allSettled([g("https://shop.example/a"), g("https://shop.example/b")]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(results.find((r) => r.status === "rejected").reason.code, "over_budget");
+});
+
+test("a reservation the payer never uses is freed after five minutes", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, maxUsdPerDay: 0.002 });
+  await g(URL1); // the payer never sends the payment (its own spend controls refused it, say)
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget");
+  t.mock.timers.tick(5 * 60 * 1000 - 1);
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget");
+  t.mock.timers.tick(2);
+  assert.equal((await g(URL1)).status, 402);
+});
+
+test("a reservation taken up by a payment is not freed by time", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, maxUsdPerDay: 0.002 });
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } });
+  t.mock.timers.tick(6 * 60 * 1000);
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget");
+});
+
+test("a retry that re-presents the held payment does not count the budget twice", async () => {
+  const s = flaky(["timeout", "ok"]);
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 0.004 });
+  const vb = in60();
+  await g(URL1);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", vb) } })); // may have settled: counted
+  await g(URL1);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", vb) } })).status, 200); // 0x01 again
+  assert.equal((await g("https://shop.example/other")).status, 402); // 0.002 of 0.004 left
+  await assert.rejects(g("https://shop.example/third"), (e) => e.code === "over_budget");
+});
+
+test("a seller that took a payment and did not deliver is not paid again for other calls", async () => {
+  let paidAnswer = () => new Response("oops", { status: 500 });
+  const inner = async (req) =>
+    req.headers.has("PAYMENT-SIGNATURE") ? paidAnswer() : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(inner, { fetch: a.f });
+  await g(URL1);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", in60()) } })).status, 500);
+  assert.equal((await g(URL1)).status, 402, "the same purchase may be retried: the held payment goes again, no new money");
+  await assert.rejects(g("https://shop.example/other"), (e) => e.code === "not_delivered_before" && /0xAAA/.test(e.message));
+  const open = guardFetch(inner, { fetch: a.f, onNotDelivered: "allow" });
+  await open(URL1);
+  await open(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", in60()) } });
+  assert.equal((await open("https://shop.example/other")).status, 402);
+  // a definite refusal took no money: no mark
+  paidAnswer = () => new Response("{}", { status: 402, headers: { "PAYMENT-RESPONSE": b64({ success: false, errorReason: "insufficient_funds", transaction: "" }) } });
+  const g3 = guardFetch(inner, { fetch: a.f });
+  await g3(URL1);
+  await g3(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x03", in60()) } });
+  assert.equal((await g3("https://shop.example/other")).status, 402);
+});
+
+test("allowUrlPrefixes scopes payments by path, not only by host", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, allowUrlPrefixes: ["https://shop.example/paid"] });
+  assert.equal((await g(URL1 + "?q=1")).status, 402);
+  for (const url of ["https://shop.example/refund", "https://shop.example.evil.com/paid", "http://shop.example/paid", "https://shop.example/paid/../refund"]) {
+    await assert.rejects(g(url), (e) => e.code === "not_allowed_url", url);
+  }
+  assert.equal(a.calls.length, 1, "refused before alalanet is asked");
+  const both = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, allowUrlPrefixes: ["https://shop.example/paid"], allowHosts: ["other.example"] });
+  assert.equal((await both("https://other.example/x")).status, 402);
+  assert.equal((await both(URL1)).status, 402);
+  await assert.rejects(both("https://shop.example/refund"), (e) => e.code === "not_allowed_url");
+});
+
+const PAYEE = "0x1234" + "5".repeat(32) + "abcd";
+const LOOKALIKE = "0x1234" + "d3ad".repeat(8) + "abcd";
+
+test("expectPayTo pins the payee per host or URL prefix", async () => {
+  const a = alalanet(() => ({ decision: "allow" }));
+  const r = await guardFetch(server().inner, { fetch: a.f, expectPayTo: { "shop.example": "0xaaa" } })(URL1);
+  assert.deepEqual(unb64(r.headers.get("PAYMENT-REQUIRED")).accepts.map((x) => x.payTo), ["0xAAA"]);
+  await assert.rejects(guardFetch(server().inner, { fetch: a.f, expectPayTo: { "https://shop.example/": ["0xBBB"] } })(URL1), (e) => e.code === "pay_to_unexpected" && /0xAAA/.test(e.message));
+  assert.equal((await guardFetch(server().inner, { fetch: a.f, expectPayTo: { "other.example": "0xBBB", "https://shop.example/else": "0xBBB" } })(URL1)).status, 402);
+});
+
+test("a look-alike of a payee paid before or expected is refused", async () => {
+  let accepts = [{ ...good, payTo: PAYEE }];
+  const inner = async (req) =>
+    req.headers.has("PAYMENT-SIGNATURE")
+      ? new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx" }) } })
+      : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts }) } });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(inner, { fetch: a.f });
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPayTo(PAYEE, "0x01", in60()) } });
+  accepts = [{ ...good, payTo: LOOKALIKE }];
+  await assert.rejects(g("https://shop.example/two"), (e) => e.code === "pay_to_lookalike" && e.message.includes(PAYEE));
+  accepts = [{ ...good, payTo: PAYEE.toUpperCase().replace("0X", "0x") }];
+  assert.equal((await g("https://shop.example/three")).status, 402, "the same address in other case is not a look-alike");
+  accepts = [{ ...good, payTo: LOOKALIKE }];
+  await assert.rejects(guardFetch(inner, { fetch: a.f, expectPayTo: { "other.example": PAYEE } })(URL1), (e) => e.code === "pay_to_lookalike");
+});
+
+test("userAgent goes in front of the guard's own", async () => {
+  const uas = [];
+  const a = alalanet(() => ({ decision: "allow" }));
+  const api = (url, init) => (uas.push(init.headers["user-agent"]), a.f(url, init));
+  await guardFetch(server({ accepts: [good] }).inner, { fetch: api, userAgent: "alalanet-review/1" })(URL1);
+  await guardFetch(server({ accepts: [good] }).inner, { fetch: api })(URL1);
+  assert.deepEqual(uas, ["alalanet-review/1 x402-guard/1.5 (fetch)", "x402-guard/1.5 (fetch)"]);
+});
+
+test("a payment that comes after its reservation expired is counted again", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(server({ accepts: [good] }).inner, { fetch: a.f, maxUsdPerDay: 0.002 });
+  await g(URL1);
+  t.mock.timers.tick(6 * 60 * 1000);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } }); // a slow payer: it still paid
+  await assert.rejects(g(URL1), (e) => e.code === "over_budget");
+});
+
+test("parallel 402s that each take the whole budget: the second sees it spent", async () => {
+  const s = server({ accepts: [{ ...good, amount: "100000" }] });
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 0.1 });
+  const results = await Promise.allSettled([g("https://shop.example/a"), g("https://shop.example/b")]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.match(results.find((r) => r.status === "rejected").reason.message, /daily budget spent/);
+});
+
+test("a retry refused as already paid frees the reservation made for it", async () => {
+  const s = flaky(["502"]);
+  const a = alalanet(() => ({ decision: "allow" }));
+  const api = async (url, init) => (String(url).includes("payment-status") ? new Response(JSON.stringify({ state: "settled", retry: "do_not_pay_again", safe_to_sign_new: false, tx: "0xpaid" })) : a.f(url, init));
+  const g = guardFetch(s.inner, { fetch: api, maxUsdPerDay: 0.004, onNotDelivered: "allow" });
+  const past = Math.floor(Date.now() / 1000) - 1;
+  await g(URL1);
+  await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", past) } }); // 502: may have settled, counted
+  await g(URL1);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", past + 120) } }), (e) => e.code === "already_paid");
+  assert.equal((await g("https://shop.example/other")).status, 402, "0.002 of 0.004 left: the refused retry's reservation was freed");
+});
+
+test("a definite refusal of a re-presented payment frees that payment's share", async () => {
+  const s = flaky(["timeout", "reject"]);
+  const a = alalanet(() => ({ decision: "allow" }));
+  const g = guardFetch(s.inner, { fetch: a.f, maxUsdPerDay: 0.004 });
+  const vb = in60();
+  await g(URL1);
+  await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x01", vb) } }));
+  await g(URL1);
+  assert.equal((await g(URL1, { headers: { "PAYMENT-SIGNATURE": evmPay("0x02", vb) } })).status, 402); // 0x01 again, refused for sure
+  assert.equal((await g("https://shop.example/a")).status, 402);
+  assert.equal((await g("https://shop.example/b")).status, 402, "the whole 0.004 is free again");
+});
+
+test("a look-alike shares both the first and the last four characters", async () => {
+  const half = ["0x1234" + "e".repeat(32) + "ffff", "0xffff" + "e".repeat(32) + "abcd"];
+  for (const payTo of half) {
+    const a = alalanet(() => ({ decision: "allow" }));
+    const r = await guardFetch(server({ accepts: [{ ...good, payTo }] }).inner, { fetch: a.f, expectPayTo: { "other.example": PAYEE } })(URL1);
+    assert.equal(r.status, 402, payTo);
+  }
 });
