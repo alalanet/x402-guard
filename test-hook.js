@@ -152,7 +152,7 @@ test("a per-seller budget counts that seller only", async () => {
   await client.createPaymentPayload(required([good], "https://other.example/paid"));
 });
 
-// --- independent review of 1.4.0 ---------------------------------------------------------------
+// --- the daily budget under concurrent payments, lost answers and failures -----------------------
 
 test("concurrent payments cannot all pass one daily budget", async () => {
   const { client, signed } = makeClient({ maxUsdPerDay: 0.005 }, () => ({ decision: "allow" }));
@@ -403,7 +403,7 @@ test("the same for a payment let through by onUnchecked", async () => {
   await assert.rejects(client.createPaymentPayload(pr), /over_budget/);
 });
 
-// --- 1.5: new sellers, the cheapest option, one open payment per resource (FIZZL-EXAM-1) ---------
+// --- new sellers, the cheapest option, one open payment per resource -----------------------------
 
 test("a new seller is paid by default up to $0.05; a hold that compares against data is not", async () => {
   const fresh = makeClient({}, () => ({ decision: "hold", reasons: ["unknown_service", "testnet"] }));
@@ -614,11 +614,11 @@ test("paid MCP tools: one open payment per tool, not per server URL", async () =
   assert.equal(signed.length, 2);
 });
 
-// --- 2.0 round 2: review-1116 guard15 probes, adopted --------------------------------------------
+// --- new-seller holds under host scopes, payees named by other sellers, dropped reasons ----------
 
 const NEWHOLD = () => ({ decision: "hold", reasons: ["unknown_service", "testnet"] });
 
-test("Q1d with allowHosts or allowUrlPrefixes, a new-seller hold on a URL the 402 names is not paid", async () => {
+test("with allowHosts or allowUrlPrefixes, a new-seller hold on a URL the 402 names is not paid", async () => {
   const at = (u) => required([{ ...good, payTo: "0xEVIL" }], u);
   for (const scope of [{ allowHosts: ["api.trusted.example"] }, { allowUrlPrefixes: ["https://api.trusted.example/"] }]) {
     const h = makeClient(scope, NEWHOLD);
@@ -637,13 +637,13 @@ test("Q1d with allowHosts or allowUrlPrefixes, a new-seller hold on a URL the 40
   assert.equal(pinned.signed.length + chosen.signed.length + open.signed.length, 3);
 });
 
-test("Q2a documented: a seller naming another resource each time is paid each time", async () => {
+test("documented: a seller naming another resource each time is paid each time", async () => {
   const { client, signed } = makeClient({}, () => ({ decision: "allow" }));
   for (let i = 0; i < 3; i++) await client.createPaymentPayload(required([good], `https://shop.example/paid?n=${i}`));
   assert.equal(signed.length, 3);
 });
 
-test("Q2b a new payee alalanet allows (listed) is paid after another seller named its resource; an unlisted one waits", async (t) => {
+test("a new payee alalanet allows (listed) is paid after another seller named its resource; an unlisted one waits", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   let listed = false;
   const { client, signed, calls } = makeClient({}, (a) => (a.payTo === "0xAAA" && listed ? { decision: "allow" } : { decision: "hold", reasons: ["unknown_service"] }));
@@ -657,7 +657,7 @@ test("Q2b a new payee alalanet allows (listed) is paid after another seller name
   assert.equal(calls.length, 4);
 });
 
-test("Q-extra a cheaper option in another asset is no reason to refuse", async () => {
+test("a cheaper option in another asset is no reason to refuse", async () => {
   const USDT = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
   const { client, made } = makeClient({}, () => ({ decision: "allow" }));
   await client.createPaymentPayload(required([{ ...good, amount: "500000" }, { ...good, asset: USDT, amount: "400000" }]));
@@ -687,7 +687,7 @@ test("hook: quote_expired, and a reason alalanet dropped (price_differs_from_des
   assert.deepEqual([...expired.signed, ...described.signed], []);
 });
 
-// --- 2.0 round 3: review-1116 guard15 r2 probes, adopted -----------------------------------------
+// --- open payments, learned payees, pinned payees and expired decisions --------------------------
 
 function twoNetClient(decide) {
   const signed = [];
@@ -704,7 +704,7 @@ function twoNetClient(decide) {
   return { client, signed };
 }
 
-test("R2-A a second allowed payee is refused already_paid while the first payment is open; after it, it is paid", async (t) => {
+test("a second allowed payee is refused already_paid while the first payment is open; after it, it is paid", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const { client, signed } = twoNetClient(() => ({ decision: "allow" }));
   const R = "https://listed.example/r";
@@ -716,7 +716,7 @@ test("R2-A a second allowed payee is refused already_paid while the first paymen
   assert.deepEqual(signed, ["0xAAA", "0xBBB"]);
 });
 
-test("R2-D the hook learns payees only from payments alalanet allowed: a look-alike paid as new cannot lock out the honest payee", async () => {
+test("the hook learns payees only from payments alalanet allowed: a look-alike paid as new cannot lock out the honest payee", async () => {
   const HONEST = "0x1234" + "5".repeat(32) + "abcd";
   const GROUND = "0x1234" + "e".repeat(32) + "abcd";
   const { client, signed } = makeClient({}, NEWHOLD);
@@ -725,7 +725,7 @@ test("R2-D the hook learns payees only from payments alalanet allowed: a look-al
   assert.deepEqual(signed, [GROUND, HONEST]);
 });
 
-test("R2-E the expectPayTo exception pays only the pinned payee; a resourceUrl string does not lift the scope rule", async () => {
+test("the expectPayTo exception pays only the pinned payee; a resourceUrl string does not lift the scope rule", async () => {
   const pinned = makeClient({ allowHosts: ["api.trusted.example"], expectPayTo: { "api.trusted.example": "0xAAA" } }, NEWHOLD);
   await assert.rejects(pinned.client.createPaymentPayload(required([{ ...good, payTo: "0xEVIL" }], "https://api.trusted.example/x")), /pay_to_unexpected/);
   await pinned.client.createPaymentPayload(required([good], "https://api.trusted.example/x"));
@@ -759,7 +759,7 @@ test("hook: a decision already past its expiry is asked again once, then refused
   assert.deepEqual([twice.signed.length, twice.calls.length], [0, 2]);
 });
 
-test("R5-F hook: a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
+test("hook: a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
   for (const failOpen of [true, false]) {
     let n = 0;
     const fetch = async (url, init) => {

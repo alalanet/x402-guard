@@ -301,7 +301,7 @@ test("an option without a known USD price is not paid when a budget is set", asy
   assert.equal(r.status, 402);
 });
 
-// --- 1.5: new sellers, the cheapest option, reservations, scopes (FIZZL-EXAM-1) ------------------
+// --- new sellers, the cheapest option, reservations, scopes --------------------------------------
 
 const NEW_REASONS = ["unknown_service", "not_checked_yet", "not_rated_yet", "pay_to_never_seen"];
 const evmPayTo = (payTo, nonce, validBefore) =>
@@ -554,7 +554,7 @@ test("allowUrlPrefixes: an encoded slash or dot segment cannot climb out of the 
   assert.equal((await g("https://shop.example/paid/x%20y")).status, 402);
 });
 
-// --- 2.0 round 2: review-1116 guard15 probes, adopted --------------------------------------------
+// --- the new-seller cap per guard, the wait queue, URL prefixes, look-alike memory ---------------
 
 const NEWHOLD = { decision: "hold", reasons: ["unknown_service", "testnet"] };
 const sellerOf = (acceptsFor) => async (req) =>
@@ -562,7 +562,7 @@ const sellerOf = (acceptsFor) => async (req) =>
     ? new Response("ok", { status: 200, headers: { "PAYMENT-RESPONSE": b64({ success: true, transaction: "0xtx", network: "eip155:8453" }) } })
     : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: acceptsFor(req.url) }) } });
 
-test("Q1a/Q1b the new-seller day cap is per guard object: all new sellers together, a new guard starts again", async () => {
+test("the new-seller day cap is per guard object: all new sellers together, a new guard starts again", async () => {
   let n = 0;
   const addr = (k) => "0x" + k.toString(16).padStart(40, "0");
   const g = guardFetch(sellerOf(() => [{ ...good, amount: "50000", payTo: addr(++n) }]), { fetch: alalanet(() => NEWHOLD).f });
@@ -582,7 +582,7 @@ test("Q1a/Q1b the new-seller day cap is per guard object: all new sellers togeth
   assert.equal((await fresh("https://e0.example/x")).status, 402);
 });
 
-test("Q3a at most 100 402s wait for their payment per URL: the 101st is refused, nothing goes uncounted", async () => {
+test("at most 100 402s wait for their payment per URL: the 101st is refused, nothing goes uncounted", async () => {
   const a = alalanet(() => ({ decision: "allow" }));
   const g = guardFetch(sellerOf(() => [{ ...good, amount: "10000" }]), { fetch: a.f, maxUsdPerDay: 1.01 });
   for (let i = 0; i < 100; i++) await g(URL1);
@@ -593,7 +593,7 @@ test("Q3a at most 100 402s wait for their payment per URL: the 101st is refused,
   await assert.rejects(g("https://shop.example/last"), (e) => e.code === "over_budget");
 });
 
-test("Q3b a payment that comes after its reservation expired is checked against the budget again", async (t) => {
+test("a payment that comes after its reservation expired is checked against the budget again", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const a = alalanet(() => ({ decision: "allow" }));
   const sent = [];
@@ -607,7 +607,7 @@ test("Q3b a payment that comes after its reservation expired is checked against 
   assert.deepEqual(sent, ["https://shop.example/b"], "the late payment never left");
 });
 
-test("Q4a a URL prefix matches at a path segment boundary only", async () => {
+test("a URL prefix matches at a path segment boundary only", async () => {
   const a = alalanet(() => ({ decision: "allow" }));
   const g = guardFetch(sellerOf(() => [good]), { fetch: a.f, allowUrlPrefixes: ["https://market.example/s/abc"] });
   for (const u of ["https://market.example/s/abcevil/pay", "https://market.example/s/abc-refund"]) await assert.rejects(g(u), (e) => e.code === "not_allowed_url", u);
@@ -617,13 +617,13 @@ test("Q4a a URL prefix matches at a path segment boundary only", async () => {
   await assert.rejects(slash("https://market.example/s/abc"), (e) => e.code === "not_allowed_url");
 });
 
-test("Q4b a path with ';' (Tomcat, Jetty and Spring read '..;' as '..') never matches a prefix", async () => {
+test("a path with ';' (Tomcat, Jetty and Spring read '..;' as '..') never matches a prefix", async () => {
   const a = alalanet(() => ({ decision: "allow" }));
   const g = guardFetch(sellerOf(() => [good]), { fetch: a.f, allowUrlPrefixes: ["https://market.example/s/abc/"] });
   for (const u of ["https://market.example/s/abc/..;/evil/pay", "https://market.example/s/abc/x;jsessionid=1"]) await assert.rejects(g(u), (e) => e.code === "not_allowed_url", u);
 });
 
-test("Q4c look-alike memory is per host, and a payee alalanet allows is not refused for looking like one paid", async () => {
+test("look-alike memory is per host, and a payee alalanet allows is not refused for looking like one paid", async () => {
   const HONEST = "0x1234" + "5".repeat(32) + "abcd";
   const GROUND = "0x1234" + "e".repeat(32) + "abcd";
   let payTo = GROUND;
@@ -636,7 +636,7 @@ test("Q4c look-alike memory is per host, and a payee alalanet allows is not refu
   assert.equal((await g("https://evil.example/y")).status, 402, "same host, but alalanet allows it");
 });
 
-test("Q-extra cheapest is per payee, network and asset: a cheaper other asset does not withhold USDC", async () => {
+test("cheapest is per payee, network and asset: a cheaper other asset does not withhold USDC", async () => {
   const USDT = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
   const a = alalanet((o) => ({ decision: "allow", network_id: o.network }));
   const g = guardFetch(sellerOf(() => [{ ...good, amount: "500000" }, { ...good, asset: USDT, amount: "400000" }]), { fetch: a.f });
@@ -644,7 +644,7 @@ test("Q-extra cheapest is per payee, network and asset: a cheaper other asset do
   assert.deepEqual(accepts.map((x) => x.asset), [USDT, good.asset]);
 });
 
-test("Q-extra not_delivered_before: another purchase on the same URL is new money; the mark is per host", async () => {
+test("not_delivered_before: another purchase on the same URL is new money; the mark is per host", async () => {
   const inner = async (req) =>
     req.headers.has("PAYMENT-SIGNATURE") ? new Response("oops", { status: 500 }) : new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [good] }) } });
   const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
@@ -692,9 +692,9 @@ test("preflight's quote_expired (block) is never paid; a reason alalanet dropped
   assert.equal((await guardFetch(server({ accepts: [good] }).inner, { fetch: described.f, onHold: "allow" })(URL1)).status, 402);
 });
 
-// --- 2.0 round 3: review-1116 guard15 r2 probes, adopted -----------------------------------------
+// --- the approval queue's bounds, unapproved paid requests, pins on a slash-less prefix ----------
 
-test("R2-B unpaid approved 402s leave after 20 minutes: 1,000 bait URLs cannot lock new URLs out for long", async (t) => {
+test("unpaid approved 402s leave after 20 minutes: 1,000 bait URLs cannot lock new URLs out for long", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
   const inner = async () => new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": b64({ x402Version: 2, accepts: [{ ...good, amount: "100" }] }) } });
   const g = guardFetch(inner, { fetch: alalanet(() => ({ decision: "allow" })).f });
@@ -724,7 +724,7 @@ test("a paid request the guard did not approve is refused before it goes out; a 
   assert.equal((await open(URL1, { headers: { "PAYMENT-SIGNATURE": "sig" } })).status, 200);
 });
 
-test("R2-C a payee marked while a POST is in flight: that POST's 402 is judged, not a TypeError", async () => {
+test("a payee marked while a POST is in flight: that POST's 402 is judged, not a TypeError", async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const inner = async (req) => {
@@ -741,14 +741,14 @@ test("R2-C a payee marked while a POST is in flight: that POST's 402 is judged, 
   await assert.rejects(slow, (e) => e.code === "not_delivered_before");
 });
 
-test("R2-F an expectPayTo pin on a slash-less prefix also covers a sibling (safe side, documented)", async () => {
+test("an expectPayTo pin on a slash-less prefix also covers a sibling (safe side, documented)", async () => {
   const g = guardFetch(sellerOf(() => [{ ...good, payTo: "0xDDD" }]), { fetch: alalanet(() => ({ decision: "allow" })).f, expectPayTo: { "https://market.example/s/abc": "0xAAA" } });
   await assert.rejects(g("https://market.example/s/abcd/x"), (e) => e.code === "pay_to_unexpected");
 });
 
-// --- 2.0 P3-F (review-1116 guard15 r3) -----------------------------------------------------------
+// --- a full queue under failOpen; an approval put back after a definite refusal ------------------
 
-test("R3-A failOpen: once 1,000 URLs wait, a failOpen pass is refused like any 402; no URL's approval is evicted", async () => {
+test("failOpen: once 1,000 URLs wait, a failOpen pass is refused like any 402; no URL's approval is evicted", async () => {
   let down = false;
   const a = alalanet(() => ({ decision: "allow" }));
   const api = (url, init) => (down ? Promise.reject(new Error("ECONNREFUSED")) : a.f(url, init));
@@ -919,7 +919,7 @@ test("an approval put back after a definite refusal still lapses at the decision
   await assert.rejects(g(URL1, { headers: { "PAYMENT-SIGNATURE": "sig2" } }), (e) => e.code === "not_approved");
 });
 
-test("R5-F a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
+test("a decision expired on arrival whose re-ask fails is refused decision_expired, failOpen or not", async () => {
   for (const failOpen of [true, false]) {
     let n = 0;
     const api = async (url, init) => {
